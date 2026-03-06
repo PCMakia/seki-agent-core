@@ -10,9 +10,9 @@ app = FastAPI(title="Agent Framework API")
 llm = LLMClient()
 
 # Simple stack memory (backend-only):
-# - Stores the last 5 role/content turns (user + assistant)
+# - Stores the last 6 role/content turns (user + assistant)
 # - Single global session (no session_id support yet)
-HISTORY_LIMIT = 5
+HISTORY_LIMIT = 6
 chat_history: list[dict[str, str]] = []
 
 
@@ -25,6 +25,20 @@ def push_message(role: str, content: str) -> None:
 def get_history() -> list[dict[str, str]]:
     return list(chat_history)
 
+# helper formating the stack memory into string for block
+def pull_memory(recent_chats: list[dict[str, str]]) -> str:
+    text_res = "[Recent conversation:"
+    pair = 0
+    for round in recent_chats:
+        pair += 1
+        (role, role_val), (content, content_val) = round.items()
+        if pair == 1:
+            text_res = text_res + " " + role_val + ": " + content_val
+        elif pair == 2:
+            pair = 0
+            text_res = text_res + "\n" + role_val + ": " + content_val + ";"
+    text_res += "]"
+    return text_res
 
 class ChatRequest(BaseModel):
     message: str
@@ -43,6 +57,8 @@ async def health():
 @app.post("/agent/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     history = get_history()
+    # add a way to convert history into raw text for the prompt
+    his_request = pull_memory(history)
     result = llm.generate(req.message, history=history)
     reply = result["completion"]
     usage = result.get("usage")

@@ -1,3 +1,4 @@
 plan
 src/__pycache__
 data/logs
+tests

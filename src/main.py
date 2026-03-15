@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from src.llm_client import LLMClient
 from src.chat_logger import append_json_log, append_text_log
+from src.prompt_builder import build_secretary_prompt
 
 app = FastAPI(title="Agent Framework API")
 llm = LLMClient()
@@ -25,20 +26,6 @@ def push_message(role: str, content: str) -> None:
 def get_history() -> list[dict[str, str]]:
     return list(chat_history)
 
-# helper formating the stack memory into string for block
-def pull_memory(recent_chats: list[dict[str, str]]) -> str:
-    text_res = "[Recent conversation:"
-    pair = 0
-    for round in recent_chats:
-        pair += 1
-        (role, role_val), (content, content_val) = round.items()
-        if pair == 1:
-            text_res = text_res + " " + role_val + ": " + content_val
-        elif pair == 2:
-            pair = 0
-            text_res = text_res + "\n" + role_val + ": " + content_val + ";"
-    text_res += "]"
-    return text_res
 
 class ChatRequest(BaseModel):
     message: str
@@ -57,9 +44,21 @@ async def health():
 @app.post("/agent/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     history = get_history()
-    # add a way to convert history into raw text for the prompt
-    his_request = pull_memory(history)
-    result = llm.generate(req.message, history=history)
+
+    # CLS-M: pass MemoryManager.retrieve_context(session_id, req.message)
+    # normalized to a string as clsm_memory; prompt shape stays unchanged.
+    clsm_memory_block = ""
+
+    prompt = build_secretary_prompt(
+        user_input=req.message,
+        recent_messages=history,
+        clsm_memory=clsm_memory_block,
+        conversation_summary="",
+        instruction=None,
+    )
+
+    # Use the structured secretary prompt as a single-turn input.
+    result = llm.generate(prompt, history=[])
     reply = result["completion"]
     usage = result.get("usage")
 

@@ -33,10 +33,16 @@ def get_history() -> list[dict[str, str]]:
 
 class ChatRequest(BaseModel):
     message: str
+    # Optional session identifier; GUI/backend callers may omit it.
     session_id: str | None = None
 
 class ChatResponse(BaseModel):
     reply: str
+    prompt: str
+
+
+class PromptDebugResponse(BaseModel):
+    prompt: str
 
 @app.get("/")
 async def root():
@@ -60,6 +66,33 @@ async def memory_debug(limit: int = Query(20, ge=1, le=64)):
         print(f"[memory] Failed to read debug metrics: {exc}")
         samples = []
     return {"samples": samples}
+
+
+@app.post("/agent/prompt-debug", response_model=PromptDebugResponse)
+async def prompt_debug(req: ChatRequest):
+    """Return the structured secretary prompt without calling the LLM.
+
+    This is for GUI/debugging only and does not mutate chat history or memory.
+    """
+    history = get_history()
+    session_id = (req.session_id or "default").strip() or "default"
+
+    clsm_memory_block = ""
+    try:
+        clsm_memory_block = memory.retrieve_context(session_id=session_id, user_text=req.message).block
+    except Exception as exc:
+        print(f"[memory] Failed to retrieve context (prompt-debug): {exc}")
+
+    prompt = build_secretary_prompt(
+        user_input=req.message,
+        recent_messages=history,
+        clsm_memory=clsm_memory_block,
+        conversation_summary="",
+        instruction=None,
+        mode=None,
+    )
+
+    return PromptDebugResponse(prompt=prompt)
 
 
 @app.on_event("startup")
@@ -99,6 +132,7 @@ async def chat(req: ChatRequest):
         clsm_memory=clsm_memory_block,
         conversation_summary="",
         instruction=None,
+        mode=None,
     )
 
     # Use the structured secretary prompt as a single-turn input.
@@ -138,7 +172,7 @@ async def chat(req: ChatRequest):
     except Exception as exc:
         print(f"[memory] Failed to record interaction: {exc}")
 
-    return ChatResponse(reply=reply)
+    return ChatResponse(reply=reply, prompt=prompt)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from src.chat_logger import append_json_log, append_text_log
 from src.prompt_builder import build_secretary_prompt
 from src.memory_manager import MemoryManager
 from src.memory_consolidation import ConsolidationWorker
+from src.summarizer import summarize_round
 
 app = FastAPI(title="Agent Framework API")
 llm = LLMClient()
@@ -20,6 +21,11 @@ consolidation_worker = ConsolidationWorker(store=memory.store)
 HISTORY_LIMIT = 6
 chat_history: list[dict[str, str]] = []
 
+# Session-scoped round summaries (ephemeral, not persisted).
+# Each round = one user message + one assistant reply. Deleted on app/docker down.
+ROUND_SUMMARIES_LIMIT = 10
+round_summaries: list[str] = []
+
 
 def push_message(role: str, content: str) -> None:
     chat_history.append({"role": role, "content": content})
@@ -29,6 +35,24 @@ def push_message(role: str, content: str) -> None:
 
 def get_history() -> list[dict[str, str]]:
     return list(chat_history)
+
+
+def get_conversation_summary() -> str:
+    """Return accumulated round summaries for the current session (ephemeral)."""
+    return "\n\n".join(round_summaries) if round_summaries else ""
+
+
+def _append_round_summary(user_msg: str, assistant_reply: str) -> None:
+    """Summarize a completed round and append to session-scoped round_summaries."""
+    global round_summaries
+    try:
+        summary = summarize_round(user_msg, assistant_reply, max_bullets=5, mode="llm", llm=llm)
+        if summary:
+            round_summaries.append(summary)
+            while len(round_summaries) > ROUND_SUMMARIES_LIMIT:
+                round_summaries.pop(0)
+    except Exception as exc:
+        print(f"[summarizer] Failed to summarize round: {exc}")
 
 
 class ChatRequest(BaseModel):
@@ -87,7 +111,7 @@ async def prompt_debug(req: ChatRequest):
         user_input=req.message,
         recent_messages=history,
         clsm_memory=clsm_memory_block,
-        conversation_summary="",
+        conversation_summary=get_conversation_summary(),
         instruction=None,
         mode=None,
     )
@@ -130,7 +154,7 @@ async def chat(req: ChatRequest):
         user_input=req.message,
         recent_messages=history,
         clsm_memory=clsm_memory_block,
-        conversation_summary="",
+        conversation_summary=get_conversation_summary(),
         instruction=None,
         mode=None,
     )
@@ -153,6 +177,8 @@ async def chat(req: ChatRequest):
 
     push_message("user", req.message)
     push_message("assistant", reply)
+
+    _append_round_summary(req.message, reply)
 
     try:
         append_json_log(req.message, reply, usage)

@@ -13,7 +13,12 @@ def _ensure_log_dir() -> None:
 def current_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def append_json_log(user_message: str, agent_reply: str, usage: dict | None = None) -> None:
+def append_json_log(
+    user_message: str,
+    agent_reply: str,
+    usage: dict | None = None,
+    reasoning_meta: dict | None = None,
+) -> None:
     _ensure_log_dir()
     record = {
         "timestamp": current_timestamp(),
@@ -22,6 +27,8 @@ def append_json_log(user_message: str, agent_reply: str, usage: dict | None = No
     }
     if usage is not None:
         record["usage"] = usage
+    if reasoning_meta is not None:
+        record["reasoning_meta"] = reasoning_meta
     with JSON_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 

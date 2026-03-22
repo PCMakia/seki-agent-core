@@ -9,11 +9,14 @@ from src.prompt_builder import build_secretary_prompt
 from src.memory_manager import MemoryManager
 from src.memory_consolidation import ConsolidationWorker
 from src.summarizer import summarize_round
+from src.reasoning_chain import ReasoningChainEngine, ReasoningChainResult, format_reasoning_block_text
+from src.intent_policy import classify_intent
 
 app = FastAPI(title="Agent Framework API")
 llm = LLMClient()
 memory = MemoryManager()
 consolidation_worker = ConsolidationWorker(store=memory.store)
+reasoning = ReasoningChainEngine(store=memory.store)
 
 # Simple stack memory (backend-only):
 # - Stores the last 6 role/content turns (user + assistant)
@@ -60,13 +63,28 @@ class ChatRequest(BaseModel):
     # Optional session identifier; GUI/backend callers may omit it.
     session_id: str | None = None
 
+class ReasoningMeta(BaseModel):
+    intent: str
+    intent_source: str | None = None
+    reasoning_steps_used: int = 0
+    concept_hits: int = 0
+    cache_hits: int = 0
+
+
 class ChatResponse(BaseModel):
     reply: str
     prompt: str
+    reasoning_meta: ReasoningMeta | None = None
 
 
 class PromptDebugResponse(BaseModel):
     prompt: str
+
+
+class ReasoningChainRequest(BaseModel):
+    text: str
+    session_id: str | None = None
+
 
 @app.get("/")
 async def root():
@@ -107,6 +125,20 @@ async def prompt_debug(req: ChatRequest):
     except Exception as exc:
         print(f"[memory] Failed to retrieve context (prompt-debug): {exc}")
 
+    reasoning_result: ReasoningChainResult | None = None
+    reasoning_err: str | None = None
+    try:
+        reasoning_result = reasoning.build_chain(session_id=session_id, text=req.message)
+    except Exception as exc:
+        reasoning_err = str(exc)
+        print(f"[reasoning] Failed to build chain (prompt-debug): {exc}")
+
+    intent_info = classify_intent(req.message, reasoning_result)
+    reasoning_text = format_reasoning_block_text(
+        reasoning_result, error=reasoning_err
+    )
+    intent_label = f"{intent_info['intent']} (source={intent_info['source']})"
+
     prompt = build_secretary_prompt(
         user_input=req.message,
         recent_messages=history,
@@ -114,9 +146,48 @@ async def prompt_debug(req: ChatRequest):
         conversation_summary=get_conversation_summary(),
         instruction=None,
         mode=None,
+        reasoning_block=reasoning_text,
+        intent_label=intent_label,
     )
 
     return PromptDebugResponse(prompt=prompt)
+
+
+@app.get("/agent/reasoning-cache-debug")
+async def reasoning_cache_debug(
+    session_id: str | None = Query(None),
+    limit: int = Query(10, ge=1, le=32),
+):
+    """Return recent topic-head cache entries for a session (process-local RAM).
+
+    Used by the GUI / operators to inspect chain-of-thought head bias state
+    after reasoning runs. Does not call the LLM.
+    """
+    sid = (session_id or "default").strip() or "default"
+    recent = reasoning.cache.get_recent(session_id=sid, limit=int(limit))
+    heads = [{"node_id": int(nid), "name": str(nm)} for nid, nm in recent]
+    return {"session_id": sid, "limit": int(limit), "topic_heads": heads}
+
+
+@app.post("/agent/reasoning-chain")
+async def reasoning_chain(req: ReasoningChainRequest):
+    """Build deterministic concept reasoning chain from text (no LLM call)."""
+    session_id = (req.session_id or "default").strip() or "default"
+    try:
+        result = reasoning.build_chain(session_id=session_id, text=req.text)
+        return result.to_dict()
+    except Exception as exc:
+        print(f"[reasoning] Failed to build chain: {exc}")
+        return {
+            "session_id": session_id,
+            "input_text": req.text,
+            "tokens": [],
+            "steps": [],
+            "relations": [],
+            "evidence": [],
+            "cache_hits": 0,
+            "error": str(exc),
+        }
 
 
 @app.on_event("startup")
@@ -142,6 +213,36 @@ async def chat(req: ChatRequest):
 
     session_id = (req.session_id or "default").strip() or "default"
 
+    reasoning_result: ReasoningChainResult | None = None
+    reasoning_err: str | None = None
+    try:
+        reasoning_result = reasoning.build_chain(session_id=session_id, text=req.message)
+    except Exception as exc:
+        reasoning_err = str(exc)
+        print(f"[reasoning] Failed to build chain: {exc}")
+
+    intent_info = classify_intent(req.message, reasoning_result)
+    reasoning_text = format_reasoning_block_text(
+        reasoning_result, error=reasoning_err
+    )
+    intent_label = f"{intent_info['intent']} (source={intent_info['source']})"
+
+    concept_hits = (
+        sum(1 for s in reasoning_result.steps if s.step_type == "concept")
+        if reasoning_result
+        else 0
+    )
+    reasoning_steps_used = len(reasoning_result.steps) if reasoning_result else 0
+    cache_hits = int(reasoning_result.cache_hits) if reasoning_result else 0
+    reasoning_meta = ReasoningMeta(
+        intent=intent_info["intent"],
+        intent_source=intent_info["source"],
+        reasoning_steps_used=reasoning_steps_used,
+        concept_hits=concept_hits,
+        cache_hits=cache_hits,
+    )
+    reasoning_log = reasoning_meta.model_dump()
+
     # CLS-M: retrieve context block before generation.
     # Fail-open: memory should never break the chat endpoint.
     clsm_memory_block = ""
@@ -157,6 +258,8 @@ async def chat(req: ChatRequest):
         conversation_summary=get_conversation_summary(),
         instruction=None,
         mode=None,
+        reasoning_block=reasoning_text,
+        intent_label=intent_label,
     )
 
     # Use the structured secretary prompt as a single-turn input.
@@ -181,7 +284,7 @@ async def chat(req: ChatRequest):
     _append_round_summary(req.message, reply)
 
     try:
-        append_json_log(req.message, reply, usage)
+        append_json_log(req.message, reply, usage, reasoning_meta=reasoning_log)
         append_text_log(req.message, reply)
     except Exception as exc:
         # Logging failures must not break the API
@@ -198,7 +301,7 @@ async def chat(req: ChatRequest):
     except Exception as exc:
         print(f"[memory] Failed to record interaction: {exc}")
 
-    return ChatResponse(reply=reply, prompt=prompt)
+    return ChatResponse(reply=reply, prompt=prompt, reasoning_meta=reasoning_meta)
 
 
 if __name__ == "__main__":

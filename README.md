@@ -2,6 +2,9 @@
 
 A flagship project to display my undergraduate knowledge about my favorite topic: machine learning
 
+### BIG UPDATE: Reasoning chain (first of a kind)
+A chain of reasoning without LLM interference. User -> reasoning -> response concepts -> verbalize through LLM.
+
 ### Expectation
 
 - PAA can run as an assistant to help with time scheduling on calendar and alarm

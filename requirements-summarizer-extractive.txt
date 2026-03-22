@@ -1,0 +1,2 @@
+# Required for src.summarizer (extractive is default mode)
+qwen3-embed>=1.4.0

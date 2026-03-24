@@ -2,3 +2,8 @@ plan
 src/__pycache__
 data/logs
 tests
+.env
+.env.*
+!.env.example
+data/*.sqlite3
+debug-*.log

@@ -1,6 +1,13 @@
 """Entry point for the agent framework API."""
+import base64
+import io
+import json
+import os
+import wave
+
+import httpx
 import uvicorn
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from src.llm_client import LLMClient
@@ -28,6 +35,15 @@ chat_history: list[dict[str, str]] = []
 # Each round = one user message + one assistant reply. Deleted on app/docker down.
 ROUND_SUMMARIES_LIMIT = 10
 round_summaries: list[str] = []
+
+TTS_BASE_URL = os.getenv("TTS_BASE_URL", "http://qwen3-tts:8880").rstrip("/")
+TTS_MODEL = os.getenv("TTS_MODEL", "qwen3-tts")
+TTS_VOICE = os.getenv("TTS_VOICE", "Cherry")
+TTS_RESPONSE_FORMAT = os.getenv("TTS_RESPONSE_FORMAT", "wav")
+TTS_TIMEOUT_S = float(os.getenv("TTS_TIMEOUT_SECONDS", "120"))
+MOUTH_INTERVAL_MS = int(os.getenv("MOUTH_INTERVAL_MS", "150"))
+MOUTH_OPEN_VALUE = float(os.getenv("MOUTH_OPEN_VALUE", "0.5"))
+MOUTH_CLOSED_VALUE = float(os.getenv("MOUTH_CLOSED_VALUE", "0.0"))
 
 
 def push_message(role: str, content: str) -> None:
@@ -75,6 +91,15 @@ class ChatResponse(BaseModel):
     reply: str
     prompt: str
     reasoning_meta: ReasoningMeta | None = None
+    tts_audio_base64: str | None = None
+    tts_format: str | None = None
+
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str | None = None
+    response_format: str | None = None
+    model: str | None = None
 
 
 class PromptDebugResponse(BaseModel):
@@ -93,6 +118,130 @@ async def root():
 @app.get("/agent/health")
 async def health():
     return {"status": "healthy"}
+
+
+async def synthesize_tts_audio(
+    text: str,
+    voice: str | None = None,
+    response_format: str | None = None,
+    model: str | None = None,
+) -> tuple[bytes, str]:
+    payload = {
+        "model": model or TTS_MODEL,
+        "input": text,
+        "voice": voice or TTS_VOICE,
+        "response_format": response_format or TTS_RESPONSE_FORMAT,
+    }
+
+    async with httpx.AsyncClient(timeout=TTS_TIMEOUT_S) as client:
+        resp = await client.post(f"{TTS_BASE_URL}/v1/audio/speech", json=payload)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "application/octet-stream")
+        return resp.content, content_type
+
+
+def _estimate_audio_duration_seconds(audio_bytes: bytes, content_type: str | None) -> float | None:
+    if not audio_bytes:
+        return None
+    mime = (content_type or "").lower()
+    # Keep this strict to WAV for now; other formats can be added later.
+    if "wav" not in mime and "wave" not in mime:
+        return None
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            frames = wav_file.getnframes()
+            frame_rate = wav_file.getframerate()
+            if frame_rate <= 0:
+                return None
+            return float(frames) / float(frame_rate)
+    except Exception:
+        return None
+
+
+@app.post("/agent/tts")
+async def generate_tts(req: TTSRequest):
+    audio, content_type = await synthesize_tts_audio(
+        text=req.text,
+        voice=req.voice,
+        response_format=req.response_format,
+        model=req.model,
+    )
+    return Response(content=audio, media_type=content_type)
+
+
+@app.websocket("/agent/ws")
+async def agent_ws(websocket: WebSocket):
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "type": "connected",
+            "message": "Send JSON payload: {\"message\": \"...\", \"session_id\": \"optional\"}",
+        }
+    )
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+            try:
+                payload = json.loads(raw_text)
+            except json.JSONDecodeError:
+                await websocket.send_json(
+                    {"type": "error", "message": "Invalid JSON payload."}
+                )
+                continue
+
+            message = str(payload.get("message", "")).strip()
+            session_id = payload.get("session_id")
+            if not message:
+                await websocket.send_json(
+                    {"type": "error", "message": "Missing non-empty `message` field."}
+                )
+                continue
+
+            chat_result = await chat(
+                ChatRequest(
+                    message=message,
+                    session_id=str(session_id) if session_id is not None else None,
+                )
+            )
+            await websocket.send_json(
+                {
+                    "type": "assistant_text",
+                    "reply": chat_result.reply,
+                    "reasoning_meta": (
+                        chat_result.reasoning_meta.model_dump()
+                        if chat_result.reasoning_meta is not None
+                        else None
+                    ),
+                }
+            )
+
+            if chat_result.tts_audio_base64:
+                audio_bytes = base64.b64decode(chat_result.tts_audio_base64)
+                duration_s = _estimate_audio_duration_seconds(
+                    audio_bytes, chat_result.tts_format
+                )
+                await websocket.send_json(
+                    {
+                        "type": "mouth_control",
+                        "mode": "fixed_interval",
+                        "interval_ms": MOUTH_INTERVAL_MS,
+                        "open_value": MOUTH_OPEN_VALUE,
+                        "closed_value": MOUTH_CLOSED_VALUE,
+                        "estimated_duration_s": duration_s,
+                    }
+                )
+                await websocket.send_json(
+                    {
+                        "type": "tts_audio",
+                        "audio_base64": chat_result.tts_audio_base64,
+                        "content_type": chat_result.tts_format,
+                        "estimated_duration_s": duration_s,
+                    }
+                )
+
+            await websocket.send_json({"type": "done"})
+    except WebSocketDisconnect:
+        return
 
 
 @app.get("/agent/memory/debug")
@@ -301,7 +450,23 @@ async def chat(req: ChatRequest):
     except Exception as exc:
         print(f"[memory] Failed to record interaction: {exc}")
 
-    return ChatResponse(reply=reply, prompt=prompt, reasoning_meta=reasoning_meta)
+    tts_audio_base64: str | None = None
+    tts_format: str | None = None
+    try:
+        audio_bytes, content_type = await synthesize_tts_audio(reply)
+        tts_audio_base64 = base64.b64encode(audio_bytes).decode("ascii")
+        tts_format = content_type
+    except Exception as exc:
+        # TTS failures should not break text chat responses.
+        print(f"[tts] Failed to synthesize audio: {exc}")
+
+    return ChatResponse(
+        reply=reply,
+        prompt=prompt,
+        reasoning_meta=reasoning_meta,
+        tts_audio_base64=tts_audio_base64,
+        tts_format=tts_format,
+    )
 
 
 if __name__ == "__main__":

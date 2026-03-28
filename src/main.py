@@ -1,13 +1,18 @@
 """Entry point for the agent framework API."""
+import asyncio
 import base64
 import io
 import json
 import os
+import time
+import uuid
 import wave
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from src.llm_client import LLMClient
@@ -38,7 +43,7 @@ round_summaries: list[str] = []
 
 TTS_BASE_URL = os.getenv("TTS_BASE_URL", "http://qwen3-tts:8880").rstrip("/")
 TTS_MODEL = os.getenv("TTS_MODEL", "qwen3-tts")
-TTS_VOICE = os.getenv("TTS_VOICE", "Cherry")
+TTS_VOICE = os.getenv("TTS_VOICE", "Ono_Anna")
 TTS_RESPONSE_FORMAT = os.getenv("TTS_RESPONSE_FORMAT", "wav")
 TTS_TIMEOUT_S = float(os.getenv("TTS_TIMEOUT_SECONDS", "120"))
 MOUTH_INTERVAL_MS = int(os.getenv("MOUTH_INTERVAL_MS", "150"))
@@ -65,7 +70,7 @@ def _append_round_summary(user_msg: str, assistant_reply: str) -> None:
     """Summarize a completed round and append to session-scoped round_summaries."""
     global round_summaries
     try:
-        summary = summarize_round(user_msg, assistant_reply, max_bullets=5, mode="llm", llm=llm)
+        summary = summarize_round(user_msg, assistant_reply, max_bullets=5, mode="extractive", llm=llm)
         if summary:
             round_summaries.append(summary)
             while len(round_summaries) > ROUND_SUMMARIES_LIMIT:
@@ -102,6 +107,22 @@ class TTSRequest(BaseModel):
     model: str | None = None
 
 
+class TTSJobResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: str
+
+
+class TTSJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: str
+    updated_at: str
+    content_type: str | None = None
+    audio_base64: str | None = None
+    error: str | None = None
+
+
 class PromptDebugResponse(BaseModel):
     prompt: str
 
@@ -109,6 +130,18 @@ class PromptDebugResponse(BaseModel):
 class ReasoningChainRequest(BaseModel):
     text: str
     session_id: str | None = None
+
+
+@dataclass
+class ChatPreparedContext:
+    session_id: str
+    prompt: str
+    reasoning_meta: ReasoningMeta
+    clsm_memory_block: str
+
+
+tts_jobs: dict[str, dict[str, str | None]] = {}
+tts_jobs_lock = asyncio.Lock()
 
 
 @app.get("/")
@@ -158,6 +191,138 @@ def _estimate_audio_duration_seconds(audio_bytes: bytes, content_type: str | Non
         return None
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _prepare_chat_context(message: str, session_id: str, history: list[dict[str, str]]) -> ChatPreparedContext:
+    reasoning_result: ReasoningChainResult | None = None
+    reasoning_err: str | None = None
+    try:
+        reasoning_result = reasoning.build_chain(session_id=session_id, text=message)
+    except Exception as exc:
+        reasoning_err = str(exc)
+        print(f"[reasoning] Failed to build chain: {exc}")
+
+    intent_info = classify_intent(message, reasoning_result)
+    reasoning_text = format_reasoning_block_text(
+        reasoning_result, error=reasoning_err
+    )
+    intent_label = f"{intent_info['intent']} (source={intent_info['source']})"
+
+    concept_hits = (
+        sum(1 for s in reasoning_result.steps if s.step_type == "concept")
+        if reasoning_result
+        else 0
+    )
+    reasoning_steps_used = len(reasoning_result.steps) if reasoning_result else 0
+    cache_hits = int(reasoning_result.cache_hits) if reasoning_result else 0
+    reasoning_meta = ReasoningMeta(
+        intent=intent_info["intent"],
+        intent_source=intent_info["source"],
+        reasoning_steps_used=reasoning_steps_used,
+        concept_hits=concept_hits,
+        cache_hits=cache_hits,
+    )
+
+    clsm_memory_block = ""
+    try:
+        clsm_memory_block = memory.retrieve_context(session_id=session_id, user_text=message).block
+    except Exception as exc:
+        print(f"[memory] Failed to retrieve context: {exc}")
+
+    prompt = build_secretary_prompt(
+        user_input=message,
+        recent_messages=history,
+        clsm_memory=clsm_memory_block,
+        conversation_summary=get_conversation_summary(),
+        instruction=None,
+        mode=None,
+        reasoning_block=reasoning_text,
+        intent_label=intent_label,
+    )
+    return ChatPreparedContext(
+        session_id=session_id,
+        prompt=prompt,
+        reasoning_meta=reasoning_meta,
+        clsm_memory_block=clsm_memory_block,
+    )
+
+
+def _persist_chat_side_effects(
+    *,
+    session_id: str,
+    user_message: str,
+    reply: str,
+    usage: dict | None,
+    clsm_memory_block: str,
+    reasoning_meta: ReasoningMeta,
+) -> None:
+    try:
+        memory.record_usage_metrics(
+            session_id=session_id,
+            user_text=user_message,
+            clsm_block=clsm_memory_block,
+            reply_text=reply,
+        )
+    except Exception as exc:
+        print(f"[memory] Failed to record usage metrics: {exc}")
+
+    push_message("user", user_message)
+    push_message("assistant", reply)
+
+    _append_round_summary(user_message, reply)
+
+    reasoning_log = reasoning_meta.model_dump()
+    try:
+        append_json_log(user_message, reply, usage, reasoning_meta=reasoning_log)
+        append_text_log(user_message, reply)
+    except Exception as exc:
+        print(f"[chat_logger] Failed to write chat log: {exc}")
+
+    try:
+        memory.record_interaction(
+            session_id=session_id,
+            user_text=user_message,
+            assistant_text=reply,
+            usage=usage,
+        )
+    except Exception as exc:
+        print(f"[memory] Failed to record interaction: {exc}")
+
+
+async def _run_tts_job(job_id: str, req: TTSRequest) -> None:
+    async with tts_jobs_lock:
+        job = tts_jobs.get(job_id)
+        if job is None:
+            return
+        job["status"] = "running"
+        job["updated_at"] = _utc_now_iso()
+    try:
+        audio, content_type = await synthesize_tts_audio(
+            text=req.text,
+            voice=req.voice,
+            response_format=req.response_format,
+            model=req.model,
+        )
+        async with tts_jobs_lock:
+            job = tts_jobs.get(job_id)
+            if job is None:
+                return
+            job["status"] = "completed"
+            job["content_type"] = content_type
+            job["audio_base64"] = base64.b64encode(audio).decode("ascii")
+            job["updated_at"] = _utc_now_iso()
+    except Exception as exc:
+        async with tts_jobs_lock:
+            job = tts_jobs.get(job_id)
+            if job is None:
+                return
+            job["status"] = "failed"
+            job["error"] = str(exc)
+            job["updated_at"] = _utc_now_iso()
+
+
 @app.post("/agent/tts")
 async def generate_tts(req: TTSRequest):
     audio, content_type = await synthesize_tts_audio(
@@ -167,6 +332,41 @@ async def generate_tts(req: TTSRequest):
         model=req.model,
     )
     return Response(content=audio, media_type=content_type)
+
+
+@app.post("/agent/tts/jobs", response_model=TTSJobResponse, status_code=201)
+async def create_tts_job(req: TTSRequest):
+    job_id = str(uuid.uuid4())
+    now = _utc_now_iso()
+    async with tts_jobs_lock:
+        tts_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "content_type": None,
+            "audio_base64": None,
+            "error": None,
+        }
+    asyncio.create_task(_run_tts_job(job_id, req))
+    return TTSJobResponse(job_id=job_id, status="queued", created_at=now)
+
+
+@app.get("/agent/tts/jobs/{job_id}", response_model=TTSJobStatusResponse)
+async def get_tts_job_status(job_id: str):
+    async with tts_jobs_lock:
+        job = tts_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="TTS job not found")
+    return TTSJobStatusResponse(
+        job_id=str(job["job_id"]),
+        status=str(job["status"]),
+        created_at=str(job["created_at"]),
+        updated_at=str(job["updated_at"]),
+        content_type=str(job["content_type"]) if job["content_type"] else None,
+        audio_base64=str(job["audio_base64"]) if job["audio_base64"] else None,
+        error=str(job["error"]) if job["error"] else None,
+    )
 
 
 @app.websocket("/agent/ws")
@@ -197,29 +397,66 @@ async def agent_ws(websocket: WebSocket):
                 )
                 continue
 
-            chat_result = await chat(
-                ChatRequest(
-                    message=message,
-                    session_id=str(session_id) if session_id is not None else None,
-                )
+            sid = (str(session_id) if session_id is not None else "default").strip() or "default"
+            started_at = time.perf_counter()
+            prep_started_at = time.perf_counter()
+            context = _prepare_chat_context(
+                message=message,
+                session_id=sid,
+                history=get_history(),
             )
+            prep_elapsed_ms = int((time.perf_counter() - prep_started_at) * 1000)
+
+            await websocket.send_json(
+                {"type": "reasoning_meta", "reasoning_meta": context.reasoning_meta.model_dump()}
+            )
+
+            stream_started_at = time.perf_counter()
+            first_token_ms: int | None = None
+            pieces: list[str] = []
+            try:
+                async for piece in llm.async_stream_generate(context.prompt, history=[]):
+                    if piece:
+                        if first_token_ms is None:
+                            first_token_ms = int((time.perf_counter() - stream_started_at) * 1000)
+                        pieces.append(piece)
+                        await websocket.send_json(
+                            {
+                                "type": "assistant_token",
+                                "delta": piece,
+                            }
+                        )
+            except Exception as exc:
+                await websocket.send_json(
+                    {"type": "error", "message": f"LLM stream failed: {exc}"}
+                )
+                await websocket.send_json({"type": "done"})
+                continue
+            reply = "".join(pieces).strip()
+            usage = None
+
+            _persist_chat_side_effects(
+                session_id=sid,
+                user_message=message,
+                reply=reply,
+                usage=usage,
+                clsm_memory_block=context.clsm_memory_block,
+                reasoning_meta=context.reasoning_meta,
+            )
+
             await websocket.send_json(
                 {
                     "type": "assistant_text",
-                    "reply": chat_result.reply,
-                    "reasoning_meta": (
-                        chat_result.reasoning_meta.model_dump()
-                        if chat_result.reasoning_meta is not None
-                        else None
-                    ),
+                    "reply": reply,
+                    "reasoning_meta": context.reasoning_meta.model_dump(),
                 }
             )
 
-            if chat_result.tts_audio_base64:
-                audio_bytes = base64.b64decode(chat_result.tts_audio_base64)
-                duration_s = _estimate_audio_duration_seconds(
-                    audio_bytes, chat_result.tts_format
-                )
+            tts_started_at = time.perf_counter()
+            try:
+                audio_bytes, content_type = await synthesize_tts_audio(reply)
+                duration_s = _estimate_audio_duration_seconds(audio_bytes, content_type)
+                b64_audio = base64.b64encode(audio_bytes).decode("ascii")
                 await websocket.send_json(
                     {
                         "type": "mouth_control",
@@ -233,11 +470,26 @@ async def agent_ws(websocket: WebSocket):
                 await websocket.send_json(
                     {
                         "type": "tts_audio",
-                        "audio_base64": chat_result.tts_audio_base64,
-                        "content_type": chat_result.tts_format,
+                        "audio_base64": b64_audio,
+                        "content_type": content_type,
                         "estimated_duration_s": duration_s,
+                        "generation_ms": int((time.perf_counter() - tts_started_at) * 1000),
                     }
                 )
+            except Exception as exc:
+                print(f"[tts] ws synthesis failed: {exc}")
+                await websocket.send_json(
+                    {
+                        "type": "tts_error",
+                        "message": str(exc),
+                    }
+                )
+
+            total_elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            print(
+                "[timing] ws_total_ms=%d prep_ms=%d first_token_ms=%s"
+                % (total_elapsed_ms, prep_elapsed_ms, str(first_token_ms))
+            )
 
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
@@ -358,114 +610,45 @@ async def on_shutdown() -> None:
 
 @app.post("/agent/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    started_at = time.perf_counter()
+    prep_started_at = time.perf_counter()
     history = get_history()
-
     session_id = (req.session_id or "default").strip() or "default"
-
-    reasoning_result: ReasoningChainResult | None = None
-    reasoning_err: str | None = None
-    try:
-        reasoning_result = reasoning.build_chain(session_id=session_id, text=req.message)
-    except Exception as exc:
-        reasoning_err = str(exc)
-        print(f"[reasoning] Failed to build chain: {exc}")
-
-    intent_info = classify_intent(req.message, reasoning_result)
-    reasoning_text = format_reasoning_block_text(
-        reasoning_result, error=reasoning_err
+    context = _prepare_chat_context(
+        message=req.message,
+        session_id=session_id,
+        history=history,
     )
-    intent_label = f"{intent_info['intent']} (source={intent_info['source']})"
+    prep_elapsed_ms = int((time.perf_counter() - prep_started_at) * 1000)
 
-    concept_hits = (
-        sum(1 for s in reasoning_result.steps if s.step_type == "concept")
-        if reasoning_result
-        else 0
-    )
-    reasoning_steps_used = len(reasoning_result.steps) if reasoning_result else 0
-    cache_hits = int(reasoning_result.cache_hits) if reasoning_result else 0
-    reasoning_meta = ReasoningMeta(
-        intent=intent_info["intent"],
-        intent_source=intent_info["source"],
-        reasoning_steps_used=reasoning_steps_used,
-        concept_hits=concept_hits,
-        cache_hits=cache_hits,
-    )
-    reasoning_log = reasoning_meta.model_dump()
+    llm_started_at = time.perf_counter()
+    result = llm.generate(context.prompt, history=[])
+    llm_elapsed_ms = int((time.perf_counter() - llm_started_at) * 1000)
 
-    # CLS-M: retrieve context block before generation.
-    # Fail-open: memory should never break the chat endpoint.
-    clsm_memory_block = ""
-    try:
-        clsm_memory_block = memory.retrieve_context(session_id=session_id, user_text=req.message).block
-    except Exception as exc:
-        print(f"[memory] Failed to retrieve context: {exc}")
-
-    prompt = build_secretary_prompt(
-        user_input=req.message,
-        recent_messages=history,
-        clsm_memory=clsm_memory_block,
-        conversation_summary=get_conversation_summary(),
-        instruction=None,
-        mode=None,
-        reasoning_block=reasoning_text,
-        intent_label=intent_label,
-    )
-
-    # Use the structured secretary prompt as a single-turn input.
-    result = llm.generate(prompt, history=[])
     reply = result["completion"]
     usage = result.get("usage")
 
-    # Best-effort CLS-M context efficiency metrics.
-    try:
-        memory.record_usage_metrics(
-            session_id=session_id,
-            user_text=req.message,
-            clsm_block=clsm_memory_block,
-            reply_text=reply,
-        )
-    except Exception as exc:
-        print(f"[memory] Failed to record usage metrics: {exc}")
+    _persist_chat_side_effects(
+        session_id=session_id,
+        user_message=req.message,
+        reply=reply,
+        usage=usage,
+        clsm_memory_block=context.clsm_memory_block,
+        reasoning_meta=context.reasoning_meta,
+    )
 
-    push_message("user", req.message)
-    push_message("assistant", reply)
-
-    _append_round_summary(req.message, reply)
-
-    try:
-        append_json_log(req.message, reply, usage, reasoning_meta=reasoning_log)
-        append_text_log(req.message, reply)
-    except Exception as exc:
-        # Logging failures must not break the API
-        print(f"[chat_logger] Failed to write chat log: {exc}")
-
-    # CLS-M: persist each interaction after we have the assistant reply.
-    try:
-        memory.record_interaction(
-            session_id=session_id,
-            user_text=req.message,
-            assistant_text=reply,
-            usage=usage,
-        )
-    except Exception as exc:
-        print(f"[memory] Failed to record interaction: {exc}")
-
-    tts_audio_base64: str | None = None
-    tts_format: str | None = None
-    try:
-        audio_bytes, content_type = await synthesize_tts_audio(reply)
-        tts_audio_base64 = base64.b64encode(audio_bytes).decode("ascii")
-        tts_format = content_type
-    except Exception as exc:
-        # TTS failures should not break text chat responses.
-        print(f"[tts] Failed to synthesize audio: {exc}")
+    total_elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    print(
+        "[timing] chat_total_ms=%d prep_ms=%d llm_ms=%d"
+        % (total_elapsed_ms, prep_elapsed_ms, llm_elapsed_ms)
+    )
 
     return ChatResponse(
         reply=reply,
-        prompt=prompt,
-        reasoning_meta=reasoning_meta,
-        tts_audio_base64=tts_audio_base64,
-        tts_format=tts_format,
+        prompt=context.prompt,
+        reasoning_meta=context.reasoning_meta,
+        tts_audio_base64=None,
+        tts_format=None,
     )
 
 

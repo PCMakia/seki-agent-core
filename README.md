@@ -72,15 +72,20 @@ docker compose down
 
 ### API responses
 
-`POST /agent/chat` now includes text plus optional TTS payload:
+`POST /agent/chat` is text-first and returns:
 - `reply`: assistant text
 - `prompt`: built prompt for debugging
 - `reasoning_meta`: reasoning metadata
-- `tts_audio_base64`: base64 audio bytes (nullable when TTS fails)
-- `tts_format`: response content type, for example `audio/wav`
+- `tts_audio_base64`: currently `null` by default (TTS is decoupled from chat path)
+- `tts_format`: currently `null` by default
 
 There is also a dedicated endpoint:
 - `POST /agent/tts` with `{ "text": "...", "voice": "...", "response_format": "wav", "model": "..." }`
+
+Async TTS job endpoints:
+- `POST /agent/tts/jobs` with the same payload as `/agent/tts` (returns `job_id` and `queued` status)
+- `GET /agent/tts/jobs/{job_id}` to poll `queued | running | completed | failed`
+- completed jobs include `audio_base64` and `content_type`
 
 ### WebSocket endpoint (Android/real-time)
 
@@ -95,9 +100,11 @@ There is also a dedicated endpoint:
 
 - Server event sequence:
   - `connected`: handshake/info message
-  - `assistant_text`: assistant reply text + reasoning metadata
+  - `reasoning_meta`: metadata snapshot before generation
+  - `assistant_token`: streamed text chunk (`delta`) from LLM
+  - `assistant_text`: final assistant reply text + reasoning metadata (compatibility event)
   - `mouth_control`: fixed-interval mouth mode (`interval_ms`, `open_value`, `closed_value`)
-  - `tts_audio`: base64 encoded TTS audio + `content_type`
+  - `tts_audio`: base64 full TTS audio + `content_type`
   - `done`: end of response cycle
 
 Example `mouth_control` payload:
@@ -107,7 +114,7 @@ Example `mouth_control` payload:
   "type": "mouth_control",
   "mode": "fixed_interval",
   "interval_ms": 150,
-  "open_value": 1.0,
+  "open_value": 0.5,
   "closed_value": 0.0,
   "estimated_duration_s": 2.4
 }

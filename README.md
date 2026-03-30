@@ -137,6 +137,46 @@ Agent: hello! how can I help you today?
 
 By default logs are written to `data/logs/` inside the container, which is mounted from the host via `./data:/app/data` in `docker-compose.yml`. You can override the log directory by setting the `CHAT_LOG_DIR` environment variable (default `data/logs`).
 
+### IMPORTANT: base anchoring nodes needs manual inserting.
+Base-node are the higher node than concept-node, with the relationship to the concept-node using itself as the anchor. This forms chains of concepts node relating to the base node you created.
+
+Example of adding base node group:
+```bash
+PC = store.upsert_node(name="personal_concepts", type_ = "base", summary="This pillar determines the unique identity an intelligence has. Elements in this pillar are emergent from the interactions with living-environment. Once a node is registered under this pillar, either by enough interactions-count or high affinity with lower interaction-count, the individual would have said concept as part of their identity. This means that the individual would more likely to react according to the properties of the concepts connecting to this pillar. The node with higher interaction-count has higher priority in decision making.")
+secretary = store.upsert_node(name="secretary", type_="base", summary="One of personal concepts, which is part of your identity as an existence. This one in particular is a title for doing tasks like scheduling, organizing, and managing people's life.")
+
+
+store.upsert_edge(
+    src_id=secretary,
+    dst_id=PC,
+    relation_type="anchored_to",
+)
+```
+
+### Seed memory.sqlite3 from DOCX/text
+
+Use the production seeding pipeline:
+
+```bash
+python -m src.memory_seeding --inputs docs/seed_source.docx --base-name thesis --memory-db-dir data
+```
+
+Common options:
+- `--translate`: translate each chunk to English through Ollama (`LLMClient`) before token seeding.
+- `--cluster-bases`: run embedding clustering to auto-create `type='base'` nodes and `anchored_to` edges (install extra deps first).
+- `--dry-run`: parse and tokenize without writing to SQLite.
+
+Dependency notes:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-seeding.txt
+```
+
+Operational notes:
+- Seed the same DB used by the API (`MEMORY_DB_DIR` or `--memory-db-dir` path).
+- Avoid concurrent DB writers while seeding (stop the server or use one process at a time).
+
 ### Color theme .json
 
 Each variable (for example `fg_color`) has two values: index 0 is light theme, index 1 is dark theme.

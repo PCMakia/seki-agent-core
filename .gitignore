@@ -7,3 +7,4 @@ tests
 !.env.example
 data/*.sqlite3
 debug-*.log
+set_*

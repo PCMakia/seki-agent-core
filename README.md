@@ -1,4 +1,4 @@
-### *Personal Agent Assistant*
+# *Personal Agent Assistant*
 
 A flagship project to display my undergraduate knowledge about my favorite topic: machine learning.
 
@@ -10,7 +10,7 @@ A chain of reasoning without LLM interference. User -> reasoning -> response con
 - PAA can run as an assistant to help with time scheduling on calendar and alarm.
 - Featuring a modular agent system that requires minimal adjustment in instructions when swapping LLM model (base model: `qwen3:4b`).
 
-### First Run
+# First Run
 
 *(API)*
 
@@ -52,7 +52,7 @@ Optional environment variables for `agent-framework`:
 - `TTS_VOICE`: defaults to `Cherry`
 - `TTS_RESPONSE_FORMAT`: defaults to `wav`
 
-### Run (after first run)
+# Run (after first run)
 
 Run these commands after initial setup:
 
@@ -69,6 +69,7 @@ python -m src.gui_main
 ```bash
 docker compose down
 ```
+# Details
 
 ### API responses
 
@@ -183,4 +184,28 @@ Each variable (for example `fg_color`) has two values: index 0 is light theme, i
 
 ```text
 "fg_color": ["#176109", "#0b2404"]
+```
+
+
+### FAISS index (upgrade to graph database)
+Build cluster
+```bash
+python -m src.graph_cluster_build --memory-db-dir data --link-heads
+```
+
+Embedding
+```bash
+python -m src.embedding_backfill --memory-db-dir data
+```
+Create index file
+```bash
+python -c "from src.memory_store import MemoryStore; from src.faiss_index import build_faiss_flatip_index_from_db; store=MemoryStore(); build_faiss_flatip_index_from_db(store=store); print('faiss index built')"
+```
+
+
+Ways to populate database:
+- Chat with agent
+- seed from docx
+```bash
+python -m src.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
 ```

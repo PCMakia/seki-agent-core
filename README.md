@@ -209,3 +209,51 @@ Ways to populate database:
 ```bash
 python -m src.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
 ```
+
+# Change log
+### V0.15
+- Added graph-aware memory retrieval and integrated it into memory/context selection with fail-open fallback.
+- Added graph tooling pipeline: embedding backfill, cluster/head graph builder, and FAISS index utilities.
+- Improved memory graph persistence by linking episodes to concept entities and writing bidirectional anchoring edges.
+- Added retrieval dependencies (`numpy`, `sentence-transformers`, `faiss-cpu`) plus supporting docs/scripts and external TTS API source.
+
+### V0.14
+- Added network integration for Android avatar text output.
+- [PATCH v0.14.1]
+  - Detached text and voice generation; improved text generation speed by 50%.
+- [PATCH v0.14.2]
+  - Added DOCX-based concept-node seeding for memory and improved the reasoning chain.
+- [PATCH v0.14.3]
+  - Updated README format.
+
+### V0.13
+- Initial commit of the reasoning module.
+
+### V0.12
+- Added internet search and abstractive summary features.
+- Updated application icon.
+
+### V0.11
+- Added summarizer function (not yet connected to agent flow).
+- [PATCH v0.11.1]
+  - Integrated summarizer into prompt builder.
+
+### V0.10
+- Added mode-specific instructions to specialize behavior.
+
+### V0.9
+- Integrated CLS-M memory with persistence through shutdown.
+
+### V0.8
+- Integrated prompt builder function.
+
+### V0.7
+- Updated stack memory with a limit of 5.
+- [PATCH v0.7.1]
+  - Added stack memory extraction to raw text.
+
+### V0.6
+- Updated GUI using CustomTkinter.
+
+### V0.1
+- Initialize framework.

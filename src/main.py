@@ -3,10 +3,12 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import time
 import uuid
 import wave
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -23,12 +25,90 @@ from src.memory_consolidation import ConsolidationWorker
 from src.summarizer import summarize_round
 from src.reasoning_chain import ReasoningChainEngine, ReasoningChainResult, format_reasoning_block_text
 from src.intent_policy import classify_intent
+from src.reminder_scheduler import ReminderItem, ReminderScheduler
+from src.task_scheduling import schedule_from_user_input
+from src.tools.windows.notify_user import notify_windows_reminder
 
-app = FastAPI(title="Agent Framework API")
+_LOG = logging.getLogger("personal_assistant.main")
+
 llm = LLMClient()
 memory = MemoryManager()
 consolidation_worker = ConsolidationWorker(store=memory.store)
 reasoning = ReasoningChainEngine(store=memory.store)
+
+
+async def _on_reminder_fire(item: ReminderItem) -> None:
+    # Keep terminal log for observability.
+    print(f"[reminder] due: task_id={item.task_id} start={item.event_start_ts} instruction={item.instruction[:120]}")
+    # Small local desktop reminder (best-effort, Windows only).
+    notified = notify_windows_reminder(
+        title="Scheduled Task Reminder",
+        message=(item.instruction or "You have an upcoming scheduled task.")[:220],
+    )
+    _LOG.info(
+        "[reminder] fire task_id=%s start=%s notified=%s",
+        item.task_id,
+        item.event_start_ts,
+        bool(notified),
+    )
+
+
+reminder_scheduler = ReminderScheduler(on_fire=_on_reminder_fire)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start background workers.
+    await consolidation_worker.start()
+    await reminder_scheduler.start()
+
+    # Rehydrate unresolved tasks on startup, then clear them to avoid duplicates.
+    try:
+        rows = memory.store.list_unresolved_active(limit=500)
+        loaded_ids: list[str] = []
+        for r in rows:
+            item = ReminderItem(
+                task_id=str(r["task_id"]),
+                session_id=str(r["session_id"]),
+                instruction=str(r["instruction"]),
+                payload_json=str(r["payload_json"]),
+                tags_json=str(r["tags_json"]),
+                event_start_ts=str(r["event_start_ts"]),
+                reminder_fire_at_ts=str(r["reminder_fire_at_ts"]),
+            )
+            await reminder_scheduler.add(item)
+            loaded_ids.append(item.task_id)
+        if loaded_ids:
+            # Clear loaded rows so old unresolved entries don't mix with new ones.
+            memory.store.delete_unresolved(task_ids=loaded_ids)
+    except Exception as exc:
+        print(f"[startup] Failed to rehydrate unresolved tasks: {exc}")
+
+    try:
+        yield
+    finally:
+        # Flush remaining in-memory deferred tasks back to unresolved on shutdown.
+        try:
+            items = await reminder_scheduler.snapshot_items()
+            for it in items:
+                memory.store.upsert_unresolved(
+                    task_id=it.task_id,
+                    session_id=it.session_id,
+                    instruction=it.instruction,
+                    payload_json=it.payload_json,
+                    tags_json=it.tags_json,
+                    event_start_ts=it.event_start_ts,
+                    reminder_fire_at_ts=it.reminder_fire_at_ts,
+                    status="active",
+                )
+        except Exception as exc:
+            print(f"[shutdown] Failed to persist unresolved tasks: {exc}")
+
+        await reminder_scheduler.stop()
+        await consolidation_worker.stop()
+
+
+app = FastAPI(title="Agent Framework API", lifespan=lifespan)
 
 # Simple stack memory (backend-only):
 # - Stores the last 6 role/content turns (user + assistant)
@@ -83,6 +163,19 @@ class ChatRequest(BaseModel):
     message: str
     # Optional session identifier; GUI/backend callers may omit it.
     session_id: str | None = None
+
+
+class ScheduleRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+class ScheduleResponse(BaseModel):
+    ok: bool
+    note: str
+    task_id: str | None = None
+    outlook_entry_id: str | None = None
+    start_ts: str | None = None
 
 class ReasoningMeta(BaseModel):
     intent: str
@@ -153,6 +246,37 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.post("/agent/schedule", response_model=ScheduleResponse)
+async def schedule_task(req: ScheduleRequest):
+    sid = (req.session_id or "default").strip() or "default"
+    _LOG.info("[api] /agent/schedule request session_id=%s message=%r", sid, (req.message or "")[:220])
+    try:
+        res = await schedule_from_user_input(
+            session_id=sid,
+            user_text=req.message,
+            llm=llm,
+            store=memory.store,
+            scheduler=reminder_scheduler,
+        )
+        _LOG.info(
+            "[api] /agent/schedule result ok=%s task_id=%s outlook_entry_id=%s start_ts=%s",
+            bool(res.created),
+            res.task_id,
+            res.outlook_entry_id,
+            res.start_ts,
+        )
+        return ScheduleResponse(
+            ok=bool(res.created),
+            note=res.note,
+            task_id=res.task_id,
+            outlook_entry_id=res.outlook_entry_id,
+            start_ts=res.start_ts,
+        )
+    except Exception as exc:
+        _LOG.exception("[api] /agent/schedule failed: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 async def synthesize_tts_audio(
     text: str,
     voice: str | None = None,
@@ -192,7 +316,11 @@ def _estimate_audio_duration_seconds(audio_bytes: bytes, content_type: str | Non
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Kept for backward compatibility with existing response fields, but uses
+    # the configured app timezone (EST-default) per project plan.
+    from src.time_utils import now_iso
+
+    return now_iso()
 
 
 def _prepare_chat_context(message: str, session_id: str, history: list[dict[str, str]]) -> ChatPreparedContext:

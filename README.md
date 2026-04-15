@@ -51,6 +51,12 @@ Optional environment variables for `agent-framework`:
 - `TTS_MODEL`: defaults to `qwen3-tts`
 - `TTS_VOICE`: defaults to `Cherry`
 - `TTS_RESPONSE_FORMAT`: defaults to `wav`
+- `INTERACTION_WS_PORT`: optional second WebSocket listener port for interaction events (default `8001`)
+- `INTERACTION_SCHEMA`: schema name for Android interaction payload validation (default `head_pat_v1`)
+- `OLLAMA_VISION_MODEL`: multimodal model name for streamer mode (default `llava:7b`)
+- `STREAMER_OBS_HOST` / `STREAMER_OBS_PORT` / `STREAMER_OBS_PASSWORD`: OBS WebSocket connection
+- `STREAMER_STT_ENABLED`: set `1` to enable microphone VAD+STT loop
+- `STREAMER_TTS_ENABLED`: set `1` to emit TTS in streamer mode
 
 # Run (after first run)
 
@@ -88,25 +94,43 @@ Async TTS job endpoints:
 - `GET /agent/tts/jobs/{job_id}` to poll `queued | running | completed | failed`
 - completed jobs include `audio_base64` and `content_type`
 
-### WebSocket endpoint (Android/real-time)
+### WebSocket endpoint (Android/real-time + interaction queue)
 
-`/agent/ws` provides a simple real-time channel for Android clients.
+`/agent/ws` (and alias `/agent/ws/interactions`) provide a concurrent real-time channel for Android clients.
 
 - URL: `ws://<host>:8000/agent/ws`
+- Optional second listener URL (same routes): `ws://<host>:8001/agent/ws` when `INTERACTION_WS_PORT` is enabled
 - Client sends JSON:
 
 ```json
 { "message": "Hello", "session_id": "android-cubism" }
 ```
 
+Android interaction events can be sent on the same socket while a chat turn is streaming:
+
+```json
+{
+  "type": "head_pat_long",
+  "schema": "head_pat_v1",
+  "session_id": "android-cubism",
+  "client_event_ts_ms": 1776000123456,
+  "threshold_sec": 5.0,
+  "elapsed_sec": 5.4
+}
+```
+
 - Server event sequence:
   - `connected`: handshake/info message
+  - `interaction_ack`: immediate ack for each accepted interaction event
   - `reasoning_meta`: metadata snapshot before generation
   - `assistant_token`: streamed text chunk (`delta`) from LLM
   - `assistant_text`: final assistant reply text + reasoning metadata (compatibility event)
+  - `assistant_text` with `subtype=interaction_reaction`: short delayed-event reaction generated after current processing
   - `mouth_control`: fixed-interval mouth mode (`interval_ms`, `open_value`, `closed_value`)
   - `tts_audio`: base64 full TTS audio + `content_type`
   - `done`: end of response cycle
+
+Queued interaction events are timestamped and injected into the next prompt context, so responses can acknowledge intentional delay naturally instead of feeling like backend lag.
 
 Example `mouth_control` payload:
 
@@ -137,6 +161,25 @@ Agent: hello! how can I help you today?
 ```
 
 By default logs are written to `data/logs/` inside the container, which is mounted from the host via `./data:/app/data` in `docker-compose.yml`. You can override the log directory by setting the `CHAT_LOG_DIR` environment variable (default `data/logs`).
+
+### Streamer mode (voice + OBS screen commentary)
+
+Streamer mode combines voice segments with OBS screen capture and a vision model:
+
+- Start: `POST /agent/streamer/start` with optional body `{ "enable_mic": true }`
+- Stop: `POST /agent/streamer/stop`
+- Status: `GET /agent/streamer/status`
+- Manual test segment: `POST /agent/streamer/segment` with `{ "text": "..." }`
+- Event channel: `ws://<host>:8000/agent/streamer/ws`
+
+Event channel emits:
+
+- `streamer_input`: accepted voice segment
+- `streamer_comment`: multimodal commentary reply (voice + OBS frame)
+- `tts_audio`: optional when `STREAMER_TTS_ENABLED=1`
+- `streamer_error`: runtime failures (OBS/STT/model)
+
+OBS integration uses `GetCurrentProgramScene` + `GetSourceScreenshot`. If OBS Studio Mode differs between preview/program, screenshot semantics can differ as noted in [obs-websocket issue #1257](https://github.com/obsproject/obs-websocket/issues/1257).
 
 ### IMPORTANT: base anchoring nodes needs manual inserting.
 Base-node are the higher node than concept-node, with the relationship to the concept-node using itself as the anchor. This forms chains of concepts node relating to the base node you created.
@@ -211,11 +254,24 @@ python -m src.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
 ```
 
 # Change log
+### V0.17
+- Wired Internet search to agent
+- Add sanitize function to clean up tag instructions for user in LLM result
+- Exchange qwen3:4b into phi3:mini to increase response rate (experimental)
+- In-time-response: preset dialog responses to be sent immediately after backend received user's input
+- Mobile client backend features:
+  - 2nd Websocket to accept interaction notifications from mobile client (ex. headpat)
+  - synchronize function to hold result of llm if it is too long (>150 words), splits into chunks and converting by Text-to-Speech (TTS) and send the each chunk with its audio together to mobile client 
+
+
+### V0.16
+- Added tools to interact with window application: Calendar, Internet search, Notification system
+
 ### V0.15
 - Added graph-aware memory retrieval and integrated it into memory/context selection with fail-open fallback.
 - Added graph tooling pipeline: embedding backfill, cluster/head graph builder, and FAISS index utilities.
 - Improved memory graph persistence by linking episodes to concept entities and writing bidirectional anchoring edges.
-- Added retrieval dependencies (`numpy`, `sentence-transformers`, `faiss-cpu`) plus supporting docs/scripts and external TTS API source.
+
 
 ### V0.14
 - Added network integration for Android avatar text output.

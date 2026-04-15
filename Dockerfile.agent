@@ -12,12 +12,20 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Chromium for Playwright (internet_access / JIT web). Increases image size significantly.
+# See docs/playwright_docker_agent.md for troubleshooting and alternatives.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN python -m playwright install-deps chromium \
+    && python -m playwright install chromium
+
 # Copy application code
 COPY src/ ./src/
 COPY data/ ./data/
+COPY Execution_scripts/ ./Execution_scripts/
 
 # Expose API port
 EXPOSE 8000
+EXPOSE 8001
 
 # Run application framework
 CMD ["python", "-m", "src.main"]

@@ -12,13 +12,78 @@ A chain of reasoning without LLM interference. User -> reasoning -> response con
 
 # First Run
 
-*(API)*
+Prerequisites to install manually on a fresh machine:
+- Python 3.10+ ([Download Python](https://www.python.org/downloads/)) (must provide `python` command)
+- Bash shell to run `install.sh` ([Git for Windows / Git Bash](https://git-scm.com/download/win), [WSL install guide](https://learn.microsoft.com/windows/wsl/install))
+- Docker Desktop (or Docker Engine) with Docker Compose v2 ([Docker Desktop](https://www.docker.com/products/docker-desktop/), [Docker Engine install docs](https://docs.docker.com/engine/install/), [Compose v2 docs](https://docs.docker.com/compose/))
+- NVIDIA GPU + drivers + NVIDIA Container Toolkit for GPU containers ([NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx), [NVIDIA Container Toolkit install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
+- (Optional) Hugging Face token with access to Qwen3-TTS models ([Hugging Face tokens](https://huggingface.co/settings/tokens), [Qwen3-TTS model page](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)) (`HF_TOKEN`)
+
+Install dependencies once:
+
+```bash
+bash install.sh
+```
+
+Optional flags:
+- `INSTALL_SEEDING_DEPS=0 bash install.sh` to skip seeding extras
+- `INSTALL_QWEN_TTS_PKG=1 bash install.sh` to also install `qwen-tts` into your venv
+
+Example fresh install (enables all optional installer flags):
+
+```bash
+# Bash / Git Bash / WSL
+export HF_TOKEN="hf_xxx_your_token"
+INSTALL_SEEDING_DEPS=1 INSTALL_QWEN_TTS_PKG=1 bash install.sh
+```
+
+```powershell
+# PowerShell
+$env:HF_TOKEN="hf_xxx_your_token"
+$env:INSTALL_SEEDING_DEPS="1"
+$env:INSTALL_QWEN_TTS_PKG="1"
+bash install.sh
+```
+
+What `install.sh` already installs for you:
+- main backend Python deps (`requirements.txt`)
+- GUI Python deps (`requirements-gui.txt`)
+- seeding extras (`requirements-seeding.txt`, unless disabled)
+- vendored external TTS API Python deps (`external/qwen3-tts-api/requirements.txt`)
+
+Note:
+- `requirements-summarizer-extractive.txt` is not required in the default app path because `qwen3-embed` is already listed in `requirements.txt`.
+
+## Start the service
 
 - Start backend services (agent API + Ollama + Qwen3-TTS):
 
 ```bash
 docker compose up --build
 ```
+
+## IMPORTANT: Fresh install: pull Ollama models
+
+On a new machine, Ollama may start without the model weights used by this repo.
+Default backend model is `phi3:mini` (see `docker-compose.yml`), and streamer mode may use `llava:7b`.
+
+After `docker compose up -d`, pull required models:
+
+```bash
+# Pull default chat model inside the Ollama container
+docker compose exec ollama ollama pull phi3:mini
+
+# Optional: pull vision model for streamer mode
+docker compose exec ollama ollama pull llava:7b
+```
+
+Verify installed models:
+
+```bash
+docker compose exec ollama ollama list
+```
+
+If you change `OLLAMA_MODEL` or `OLLAMA_VISION_MODEL`, pull those model names instead.
 
 The API should respond on `http://localhost:8000/agent/health`.
 
@@ -36,12 +101,11 @@ docker compose up --build
 
 The token account must have access to the Qwen3-TTS model repository on Hugging Face.
 
-*(GUI)*
+## Start PC GUI
 
 After the backend is running, launch the desktop chat GUI:
 
 ```bash
-python -m pip install -r requirements-gui.txt
 python -m src.gui_main
 ```
 
@@ -254,6 +318,10 @@ python -m src.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
 ```
 
 # Change log
+### V0.18
+- New feature: Immediate response
+  - Preset responses to confirm the backend received the input
+  - Currently only works on the mobile app Streaming mode
 ### V0.17
 - Wired Internet search to agent
 - Add sanitize function to clean up tag instructions for user in LLM result

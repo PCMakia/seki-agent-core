@@ -24,12 +24,13 @@ from pydantic import BaseModel, Field
 
 from src.llm_client import LLMClient
 from src.chat_logger import append_json_log, append_text_log
-from src.prompt_builder import build_interaction_reaction_prompt, build_secretary_prompt
+from src.prompt_builder import build_interaction_reaction_prompt, build_secretary_prompt, build_secretary_prompt_layers
 from src.memory_manager import MemoryManager
 from src.memory_consolidation import ConsolidationWorker
 from src.summarizer import summarize_round
 from src.reasoning_chain import ReasoningChainEngine, ReasoningChainResult, format_reasoning_block_text
 from src.intent_policy import classify_intent
+from src.conversation_intent import resolve_discourse_for_reasoning
 from src.reminder_scheduler import ReminderItem, ReminderScheduler
 from src.task_scheduling import schedule_from_user_input
 from src.tools.windows.notify_user import notify_windows_reminder
@@ -247,6 +248,7 @@ IN_TIME_RESPONSE_TTS = os.getenv("IN_TIME_RESPONSE_TTS", "1").strip() in {"1", "
 IN_TIME_MSG_THINK = "Hold on, I need to think for a bit"
 IN_TIME_MSG_DATABASE = "Let me check my database"
 IN_TIME_MSG_HEADPAT = "thanks for your love"
+PROMPT_LAYERED = os.getenv("PROMPT_LAYERED", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -326,6 +328,7 @@ class ReasoningMeta(BaseModel):
     reasoning_steps_used: int = 0
     concept_hits: int = 0
     cache_hits: int = 0
+    discourse_pattern: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -361,6 +364,8 @@ class TTSJobStatusResponse(BaseModel):
 
 class PromptDebugResponse(BaseModel):
     prompt: str
+    system_prompt: str = ""
+    user_prompt: str = ""
 
 
 class ReasoningChainRequest(BaseModel):
@@ -374,6 +379,7 @@ class ChatPreparedContext:
     prompt: str
     reasoning_meta: ReasoningMeta
     clsm_memory_block: str
+    system_prompt: str = ""
     reasoning_result: ReasoningChainResult | None = None
     web_knowledge_block: str = ""
 
@@ -759,10 +765,13 @@ def _prepare_chat_context(
     history: list[dict[str, str]],
     external_event_context: str = "",
 ) -> ChatPreparedContext:
+    discourse = resolve_discourse_for_reasoning(message, history)
+    reasoning_input = discourse.reasoning_input.strip() or message.strip()
+
     reasoning_result: ReasoningChainResult | None = None
     reasoning_err: str | None = None
     try:
-        reasoning_result = reasoning.build_chain(session_id=session_id, text=message)
+        reasoning_result = reasoning.build_chain(session_id=session_id, text=reasoning_input)
     except Exception as exc:
         reasoning_err = str(exc)
         print(f"[reasoning] Failed to build chain: {exc}")
@@ -771,7 +780,10 @@ def _prepare_chat_context(
     reasoning_text = format_reasoning_block_text(
         reasoning_result, error=reasoning_err
     )
-    intent_label = f"{intent_info['intent']} (source={intent_info['source']})"
+    intent_label = f"{intent_info['intent']} (source={intent_info['source']}"
+    if discourse.pattern != "default":
+        intent_label += f"; discourse={discourse.pattern}"
+    intent_label += ")"
 
     concept_hits = (
         sum(1 for s in reasoning_result.steps if s.step_type == "concept")
@@ -786,11 +798,14 @@ def _prepare_chat_context(
         reasoning_steps_used=reasoning_steps_used,
         concept_hits=concept_hits,
         cache_hits=cache_hits,
+        discourse_pattern=discourse.pattern if discourse.pattern != "default" else None,
     )
 
     clsm_memory_block = ""
     try:
-        clsm_memory_block = memory.retrieve_context(session_id=session_id, user_text=message).block
+        clsm_memory_block = memory.retrieve_context(
+            session_id=session_id, user_text=reasoning_input
+        ).block
     except Exception as exc:
         print(f"[memory] Failed to retrieve context: {exc}")
 
@@ -800,7 +815,7 @@ def _prepare_chat_context(
 
         if jit_web_enabled():
             web_knowledge_block = build_jit_web_knowledge_block(
-                user_text=message,
+                user_text=reasoning_input,
                 store=memory.store,
                 graph_retriever=reasoning.graph_retriever,
                 reasoning_result=reasoning_result,
@@ -808,21 +823,39 @@ def _prepare_chat_context(
     except Exception as exc:
         print(f"[jit_web] Failed to build web knowledge block: {exc}")
 
-    prompt = build_secretary_prompt(
-        user_input=message,
-        recent_messages=history,
-        clsm_memory=clsm_memory_block,
-        conversation_summary=get_conversation_summary(),
-        external_event_context=external_event_context,
-        instruction=None,
-        mode=None,
-        reasoning_block=reasoning_text,
-        intent_label=intent_label,
-        web_knowledge_this_turn=web_knowledge_block,
-    )
+    system_prompt = ""
+    if PROMPT_LAYERED:
+        layered = build_secretary_prompt_layers(
+            user_input=message,
+            recent_messages=history,
+            clsm_memory=clsm_memory_block,
+            conversation_summary=get_conversation_summary(),
+            external_event_context=external_event_context,
+            instruction=None,
+            mode=None,
+            reasoning_block=reasoning_text,
+            intent_label=intent_label,
+            web_knowledge_this_turn=web_knowledge_block,
+        )
+        prompt = layered.user_prompt
+        system_prompt = layered.system_prompt
+    else:
+        prompt = build_secretary_prompt(
+            user_input=message,
+            recent_messages=history,
+            clsm_memory=clsm_memory_block,
+            conversation_summary=get_conversation_summary(),
+            external_event_context=external_event_context,
+            instruction=None,
+            mode=None,
+            reasoning_block=reasoning_text,
+            intent_label=intent_label,
+            web_knowledge_this_turn=web_knowledge_block,
+        )
     return ChatPreparedContext(
         session_id=session_id,
         prompt=prompt,
+        system_prompt=system_prompt,
         reasoning_meta=reasoning_meta,
         clsm_memory_block=clsm_memory_block,
         reasoning_result=reasoning_result,
@@ -1005,7 +1038,11 @@ async def _run_ws_chat_turn(
     first_token_ms: int | None = None
     pieces: list[str] = []
     try:
-        async for piece in llm.async_stream_generate(context.prompt, history=[]):
+        async for piece in llm.async_stream_generate(
+            context.prompt,
+            system_prompt=context.system_prompt or None,
+            history=[],
+        ):
             if piece:
                 if first_token_ms is None:
                     first_token_ms = int((time.perf_counter() - stream_started_at) * 1000)
@@ -1337,16 +1374,21 @@ async def prompt_debug(req: ChatRequest):
     history = get_history()
     session_id = (req.session_id or "default").strip() or "default"
 
+    discourse = resolve_discourse_for_reasoning(req.message, history)
+    reasoning_input = discourse.reasoning_input.strip() or req.message.strip()
+
     clsm_memory_block = ""
     try:
-        clsm_memory_block = memory.retrieve_context(session_id=session_id, user_text=req.message).block
+        clsm_memory_block = memory.retrieve_context(
+            session_id=session_id, user_text=reasoning_input
+        ).block
     except Exception as exc:
         print(f"[memory] Failed to retrieve context (prompt-debug): {exc}")
 
     reasoning_result: ReasoningChainResult | None = None
     reasoning_err: str | None = None
     try:
-        reasoning_result = reasoning.build_chain(session_id=session_id, text=req.message)
+        reasoning_result = reasoning.build_chain(session_id=session_id, text=reasoning_input)
     except Exception as exc:
         reasoning_err = str(exc)
         print(f"[reasoning] Failed to build chain (prompt-debug): {exc}")
@@ -1355,7 +1397,10 @@ async def prompt_debug(req: ChatRequest):
     reasoning_text = format_reasoning_block_text(
         reasoning_result, error=reasoning_err
     )
-    intent_label = f"{intent_info['intent']} (source={intent_info['source']})"
+    intent_label = f"{intent_info['intent']} (source={intent_info['source']}"
+    if discourse.pattern != "default":
+        intent_label += f"; discourse={discourse.pattern}"
+    intent_label += ")"
 
     web_knowledge_block = ""
     try:
@@ -1363,7 +1408,7 @@ async def prompt_debug(req: ChatRequest):
 
         if jit_web_enabled():
             web_knowledge_block = build_jit_web_knowledge_block(
-                user_text=req.message,
+                user_text=reasoning_input,
                 store=memory.store,
                 graph_retriever=reasoning.graph_retriever,
                 reasoning_result=reasoning_result,
@@ -1371,6 +1416,24 @@ async def prompt_debug(req: ChatRequest):
             )
     except Exception as exc:
         print(f"[jit_web] prompt-debug web block failed: {exc}")
+
+    if PROMPT_LAYERED:
+        layered = build_secretary_prompt_layers(
+            user_input=req.message,
+            recent_messages=history,
+            clsm_memory=clsm_memory_block,
+            conversation_summary=get_conversation_summary(),
+            instruction=None,
+            mode=None,
+            reasoning_block=reasoning_text,
+            intent_label=intent_label,
+            web_knowledge_this_turn=web_knowledge_block,
+        )
+        return PromptDebugResponse(
+            prompt=layered.user_prompt,
+            user_prompt=layered.user_prompt,
+            system_prompt=layered.system_prompt,
+        )
 
     prompt = build_secretary_prompt(
         user_input=req.message,
@@ -1383,8 +1446,7 @@ async def prompt_debug(req: ChatRequest):
         intent_label=intent_label,
         web_knowledge_this_turn=web_knowledge_block,
     )
-
-    return PromptDebugResponse(prompt=prompt)
+    return PromptDebugResponse(prompt=prompt, user_prompt=prompt, system_prompt="")
 
 
 @app.get("/agent/reasoning-cache-debug")
@@ -1487,7 +1549,11 @@ async def chat_sse(req: ChatRequest):
             first_token_ms: int | None = None
             pieces: list[str] = []
             try:
-                async for piece in llm.async_stream_generate(context.prompt, history=[]):
+                async for piece in llm.async_stream_generate(
+                    context.prompt,
+                    system_prompt=context.system_prompt or None,
+                    history=[],
+                ):
                     if piece:
                         if first_token_ms is None:
                             first_token_ms = int((time.perf_counter() - stream_started_at) * 1000)
@@ -1602,7 +1668,11 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
         llm_started_at = time.perf_counter()
         try:
-            result = llm.generate(context.prompt, history=[])
+            result = llm.generate(
+                context.prompt,
+                system_prompt=context.system_prompt or None,
+                history=[],
+            )
         except Exception as exc:
             _LOG.exception("LLM generate failed (check Ollama is running and OLLAMA_MODEL is pulled)")
             raise HTTPException(

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from src.llm_client import LLMClient
+from src.LLM_handler.llm_client import LLMClient
 
 try:
     import obsws_python as obsws

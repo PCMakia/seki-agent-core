@@ -22,20 +22,20 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response, We
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.llm_client import LLMClient
+from src.LLM_handler.llm_client import LLMClient
 from src.chat_logger import append_json_log, append_text_log
-from src.prompt_builder import build_interaction_reaction_prompt, build_secretary_prompt, build_secretary_prompt_layers
-from src.memory_manager import MemoryManager
-from src.memory_consolidation import ConsolidationWorker
-from src.summarizer import summarize_round
-from src.reasoning_chain import ReasoningChainEngine, ReasoningChainResult, format_reasoning_block_text
-from src.intent_policy import classify_intent
-from src.conversation_intent import resolve_discourse_for_reasoning
+from src.LLM_handler.prompt_builder import build_interaction_reaction_prompt, build_secretary_prompt, build_secretary_prompt_layers
+from src.memory_manager.retrieval.memory_manager import MemoryManager
+from src.memory_manager.storage.memory_consolidation import ConsolidationWorker
+from src.RAG_online.summarizer import summarize_round
+from src.memory_manager.retrieval.reasoning_chain import ReasoningChainEngine, ReasoningChainResult, format_reasoning_block_text
+from src.LLM_handler.intent_policy import classify_intent
+from src.LLM_handler.conversation_intent import resolve_discourse_for_reasoning
 from src.reminder_scheduler import ReminderItem, ReminderScheduler
-from src.task_scheduling import schedule_from_user_input
-from src.tools.windows.notify_user import notify_windows_reminder
+from src.task_scheduling import outlook_calendar_side_effect_block, schedule_from_user_input
+from src.tools_external.windows.notify_user import notify_windows_reminder
 from src.streamer_mode import StreamerModeService, StreamerRuntimeConfig
-from src.reply_sanitize import sanitize_assistant_reply
+from src.LLM_handler.reply_sanitize import sanitize_assistant_reply
 
 _LOG = logging.getLogger("personal_assistant.main")
 
@@ -435,7 +435,37 @@ async def root():
 
 @app.get("/agent/health")
 async def health():
-    return {"status": "healthy"}
+    """API liveness plus best-effort Ollama reachability (does not run inference).
+
+    Chat and scheduling still call ``/api/chat``; a model can be listed but crash at
+    runtime (HTTP 500 / unexpected EOF). This endpoint clarifies why "Connected"
+    can coexist with chat failures.
+    """
+    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+    model = (os.getenv("OLLAMA_MODEL") or llm.model or "").strip()
+    ollama: dict[str, Any] = {"reachable": False, "model_present": None, "detail": None}
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{base}/api/tags")
+            r.raise_for_status()
+            payload = r.json()
+        names: list[str] = []
+        for m in payload.get("models") or []:
+            n = (m.get("name") or "").strip()
+            if n:
+                names.append(n)
+        ollama["reachable"] = True
+        ollama["model_present"] = bool(model and model in names)
+        ollama["models_count"] = len(names)
+    except Exception as exc:
+        ollama["detail"] = str(exc)[:300]
+
+    return {
+        "status": "healthy",
+        "ollama_base_url": base,
+        "ollama_model": model,
+        "ollama": ollama,
+    }
 
 
 @app.post("/agent/schedule", response_model=ScheduleResponse)
@@ -652,6 +682,18 @@ def _build_client_tags_context_block(tags: list[str]) -> str:
     return "Client source tags for this turn: " + ", ".join(tags)
 
 
+def _auto_schedule_tagged_message(message: str) -> str:
+    raw = (message or "").strip()
+    if not raw:
+        return raw
+    low = raw.lower()
+    if low.startswith("/schedule"):
+        return raw
+    if low.startswith("put on my schedule"):
+        return f"/schedule {raw}"
+    return raw
+
+
 def _tags_imply_headpat(tags: list[str]) -> bool:
     for t in tags:
         if "headpat" in t or t.startswith("head_pat") or "head pat" in t:
@@ -811,7 +853,7 @@ def _prepare_chat_context(
 
     web_knowledge_block = ""
     try:
-        from src.jit_web_knowledge import build_jit_web_knowledge_block, jit_web_enabled
+        from src.RAG_online.jit_web_knowledge import build_jit_web_knowledge_block, jit_web_enabled
 
         if jit_web_enabled():
             web_knowledge_block = build_jit_web_knowledge_block(
@@ -865,7 +907,7 @@ def _prepare_chat_context(
 
 def _run_memory_web_enrich_safe(reasoning_result: ReasoningChainResult | None) -> None:
     try:
-        from src.memory_web_enrich import enrich_nodes_from_web_after_turn, memory_web_enrich_enabled
+        from src.RAG_online.memory_web_enrich import enrich_nodes_from_web_after_turn, memory_web_enrich_enabled
 
         if not memory_web_enrich_enabled():
             return
@@ -1019,7 +1061,15 @@ async def _run_ws_chat_turn(
         pending_interactions[session_id].clear()
     event_block = _build_interaction_context_block(queued_events)
     tags_block = _build_client_tags_context_block(tags)
-    external_parts = [p for p in (event_block, tags_block) if p]
+    schedule_probe_text = _auto_schedule_tagged_message(message)
+    cal_block = await outlook_calendar_side_effect_block(
+        session_id=session_id,
+        user_text=schedule_probe_text,
+        llm=llm,
+        store=memory.store,
+        scheduler=reminder_scheduler,
+    )
+    external_parts = [p for p in (event_block, tags_block, cal_block) if p]
     context = _prepare_chat_context(
         message=message,
         session_id=session_id,
@@ -1074,7 +1124,7 @@ async def _run_ws_chat_turn(
     )
 
     try:
-        from src.memory_web_enrich import memory_web_enrich_enabled
+        from src.RAG_online.memory_web_enrich import memory_web_enrich_enabled
 
         if memory_web_enrich_enabled():
             loop = asyncio.get_running_loop()
@@ -1404,7 +1454,7 @@ async def prompt_debug(req: ChatRequest):
 
     web_knowledge_block = ""
     try:
-        from src.jit_web_knowledge import build_jit_web_knowledge_block, jit_web_enabled
+        from src.RAG_online.jit_web_knowledge import build_jit_web_knowledge_block, jit_web_enabled
 
         if jit_web_enabled():
             web_knowledge_block = build_jit_web_knowledge_block(
@@ -1532,11 +1582,20 @@ async def chat_sse(req: ChatRequest):
 
             prep_started_at = time.perf_counter()
             tags_block = _build_client_tags_context_block(tags)
+            schedule_probe_text = _auto_schedule_tagged_message(req.message)
+            cal_block = await outlook_calendar_side_effect_block(
+                session_id=session_id,
+                user_text=schedule_probe_text,
+                llm=llm,
+                store=memory.store,
+                scheduler=reminder_scheduler,
+            )
+            ext_parts = [p for p in (tags_block, cal_block) if p]
             context = _prepare_chat_context(
                 message=req.message,
                 session_id=session_id,
                 history=get_history(),
-                external_event_context=tags_block,
+                external_event_context="\n\n".join(ext_parts),
             )
             reasoning_result_for_enrich = context.reasoning_result
             prep_elapsed_ms = int((time.perf_counter() - prep_started_at) * 1000)
@@ -1627,7 +1686,7 @@ async def chat_sse(req: ChatRequest):
         finally:
             if reasoning_result_for_enrich is not None:
                 try:
-                    from src.memory_web_enrich import memory_web_enrich_enabled
+                    from src.RAG_online.memory_web_enrich import memory_web_enrich_enabled
 
                     if memory_web_enrich_enabled():
                         loop = asyncio.get_running_loop()
@@ -1658,11 +1717,20 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         session_id = (req.session_id or "default").strip() or "default"
         tags = _normalize_request_tags(req.tags)
         tags_block = _build_client_tags_context_block(tags)
+        schedule_probe_text = _auto_schedule_tagged_message(req.message)
+        cal_block = await outlook_calendar_side_effect_block(
+            session_id=session_id,
+            user_text=schedule_probe_text,
+            llm=llm,
+            store=memory.store,
+            scheduler=reminder_scheduler,
+        )
+        ext_parts = [p for p in (tags_block, cal_block) if p]
         context = _prepare_chat_context(
             message=req.message,
             session_id=session_id,
             history=history,
-            external_event_context=tags_block,
+            external_event_context="\n\n".join(ext_parts),
         )
         prep_elapsed_ms = int((time.perf_counter() - prep_started_at) * 1000)
 

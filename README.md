@@ -2,7 +2,7 @@
 
 A flagship project to display my undergraduate knowledge about my favorite topic: machine learning.
 
-### BIG UPDATE: Reasoning chain (first of a kind)
+### BIG UPDATE(): Reasoning chain
 A chain of reasoning without LLM interference. User -> reasoning -> response concepts -> verbalize through LLM.
 
 ### Expectation
@@ -17,9 +17,23 @@ Prerequisites to install manually on a fresh machine:
 - Bash shell to run `install.sh` ([Git for Windows / Git Bash](https://git-scm.com/download/win), [WSL install guide](https://learn.microsoft.com/windows/wsl/install))
 - Docker Desktop (or Docker Engine) with Docker Compose v2 ([Docker Desktop](https://www.docker.com/products/docker-desktop/), [Docker Engine install docs](https://docs.docker.com/engine/install/), [Compose v2 docs](https://docs.docker.com/compose/))
 - NVIDIA GPU + drivers + NVIDIA Container Toolkit for GPU containers ([NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx), [NVIDIA Container Toolkit install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
-- (Optional) Hugging Face token with access to Qwen3-TTS models ([Hugging Face tokens](https://huggingface.co/settings/tokens), [Qwen3-TTS model page](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)) (`HF_TOKEN`)
+- (Optional but recommended) Hugging Face token with access to Qwen3-TTS models ([Hugging Face tokens](https://huggingface.co/settings/tokens), [Qwen3-TTS 0.6B model page](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)) (`HF_TOKEN`)
 
-Install dependencies once:
+## 0) Create your local env file from template
+
+Copy `.env.example` to `.env` and edit values for your machine before first `docker compose up`:
+
+```bash
+cp .env.example .env
+```
+
+```powershell
+Copy-Item .env.example .env
+```
+
+At minimum, set `HF_TOKEN` if your Qwen3-TTS model download requires authenticated Hugging Face access.
+
+## 1) Install Python dependencies into the project venv
 
 ```bash
 bash install.sh
@@ -54,7 +68,37 @@ What `install.sh` already installs for you:
 Note:
 - `requirements-summarizer-extractive.txt` is not required in the default app path because `qwen3-embed` is already listed in `requirements.txt`.
 
-## Start the service
+## 2) Activate the same venv before running GUI/host scripts (required)
+
+Use one of these:
+
+```bash
+# Bash / Git Bash / WSL
+source .venv/bin/activate
+```
+
+```powershell
+# PowerShell
+.venv\Scripts\Activate.ps1
+```
+
+If PowerShell policy blocks activation, use the venv Python directly:
+
+```powershell
+.venv\Scripts\python -m src.GUI.gui_main
+```
+
+## 3) Review `docker-compose.yml` host paths on Windows (required)
+
+This repo currently mounts Ollama cache from:
+
+```yaml
+D:/data/ollama-data:/root/.ollama
+```
+
+If your machine does not have `D:` (or Docker Desktop file sharing for `D:` is disabled), update this path before first run (for example `C:/data/ollama-data:/root/.ollama`) and ensure the drive is shared in Docker Desktop settings.
+
+## 4) Start backend services
 
 - Start backend services (agent API + Ollama + Qwen3-TTS):
 
@@ -62,7 +106,7 @@ Note:
 docker compose up --build
 ```
 
-## IMPORTANT: Fresh install: pull Ollama models
+## 5) Fresh install: verify/pull Ollama models
 
 On a new machine, Ollama may start without the model weights used by this repo.
 Default backend model is `phi3:mini` (see `docker-compose.yml`), and streamer mode may use `llava:7b`.
@@ -101,19 +145,30 @@ docker compose up --build
 
 The token account must have access to the Qwen3-TTS model repository on Hugging Face.
 
-## Start PC GUI
+## 6) (Optional) Start Outlook bridge on host for calendar features
+
+Scheduling/calendar calls from Docker expect a host bridge at `http://host.docker.internal:8765` (default `OUTLOOK_BRIDGE_URL` in compose).  
+Run this on the Windows host if you plan to use Outlook calendar features:
+
+```bash
+python Execution_scripts/outlook_bridge_server.py
+```
+
+If you only use chat/TTS (mobile) and not Outlook calendar integration, this bridge is not required.
+
+## 7) Start PC GUI
 
 After the backend is running, launch the desktop chat GUI:
 
 ```bash
-python -m src.gui_main
+python -m src.GUI.gui_main
 ```
 
 Optional environment variables for `agent-framework`:
 - `AGENT_BASE_URL`: defaults to `http://localhost:8000` (GUI side)
 - `TTS_BASE_URL`: defaults to `http://qwen3-tts:8880` (container-to-container)
-- `TTS_MODEL`: defaults to `qwen3-tts`
-- `TTS_VOICE`: defaults to `Cherry`
+- `TTS_MODEL`: defaults to `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` in `docker-compose.yml` (code fallback is `qwen3-tts` when env is unset)
+- `TTS_VOICE`: defaults to `Ono_Anna`
 - `TTS_RESPONSE_FORMAT`: defaults to `wav`
 - `INTERACTION_WS_PORT`: optional second WebSocket listener port for interaction events (default `8001`)
 - `INTERACTION_SCHEMA`: schema name for Android interaction payload validation (default `head_pat_v1`)
@@ -128,7 +183,7 @@ Run these commands after initial setup:
 
 ```bash
 docker compose up -d
-python -m src.gui_main
+python -m src.GUI.gui_main
 ```
 
 ### Terminate
@@ -266,7 +321,7 @@ store.upsert_edge(
 Use the production seeding pipeline:
 
 ```bash
-python -m src.memory_seeding --inputs docs/seed_source.docx --base-name thesis --memory-db-dir data
+python -m src.memory_manager.storage.memory_seeding --inputs docs/seed_source.docx --base-name thesis --memory-db-dir data
 ```
 
 Common options:
@@ -297,16 +352,16 @@ Each variable (for example `fg_color`) has two values: index 0 is light theme, i
 ### FAISS index (upgrade to graph database)
 Build cluster
 ```bash
-python -m src.graph_cluster_build --memory-db-dir data --link-heads
+python -m src.memory_manager.storage.graph_cluster_build --memory-db-dir data --link-heads
 ```
 
 Embedding
 ```bash
-python -m src.embedding_backfill --memory-db-dir data
+python -m src.memory_manager.storage.embedding_backfill --memory-db-dir data
 ```
 Create index file
 ```bash
-python -c "from src.memory_store import MemoryStore; from src.faiss_index import build_faiss_flatip_index_from_db; store=MemoryStore(); build_faiss_flatip_index_from_db(store=store); print('faiss index built')"
+python -c "from src.memory_manager.storage.memory_store import MemoryStore; from src.memory_manager.storage.faiss_index import build_faiss_flatip_index_from_db; store=MemoryStore(); build_faiss_flatip_index_from_db(store=store); print('faiss index built')"
 ```
 
 
@@ -314,10 +369,15 @@ Ways to populate database:
 - Chat with agent
 - seed from docx
 ```bash
-python -m src.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
+python -m src.memory_manager.storage.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
 ```
 
 # Change log
+### V1.0: IMPORTANT (need fresh install from beta)
+- Structural subfolders in src
+- Wired the outlook (legacy version) interaction scripts into the agent
+- Adding Structure.md for keep track of script's functions 
+
 ### V0.18
 - New feature: Immediate response
   - Preset responses to confirm the backend received the input

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unified installer for the Personal Assistant repo.
+# Unified installer for the Private Agent Assistant repo.
 # Installs Python dependencies for:
 # - main agent backend
 # - desktop GUI
@@ -86,7 +86,7 @@ echo "Next:"
 echo "1) Start backend services:"
 echo "   docker compose up --build"
 echo "2) Run GUI (new shell, same venv):"
-echo "   python -m src.gui_main"
+echo "   python -m src.GUI.gui_main"
 echo
 echo "If qwen3-tts fails with missing model/tokenizer assets, set HF_TOKEN before docker compose:"
 echo "  export HF_TOKEN=\"hf_xxx\"        # bash"

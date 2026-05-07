@@ -8,5 +8,7 @@ tests
 data/*.sqlite3
 debug-*.log
 set_*
+.venv/
+
 
 *__pycache__*

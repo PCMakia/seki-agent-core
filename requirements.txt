@@ -13,7 +13,8 @@ faiss-cpu
 qwen3-embed
 # Windows-only deps (Docker builds on Linux will skip these).
 pywin32; platform_system == "Windows"
-playsound==1.3.0; platform_system == "Windows"
+# playsound 1.3.0 fails to build on Python 3.12+ (fallback in create_alarm.py uses winsound).
+playsound==1.3.0; platform_system == "Windows" and python_version < "3.12"
 obsws-python>=1.7.0
 Pillow>=10.4.0
 faster-whisper>=1.1.1

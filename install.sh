@@ -83,9 +83,11 @@ echo
 echo "Install complete."
 echo
 echo "Next:"
-echo "1) Start backend services:"
+echo "1) Follow step 2, 3 in README.md to ensure correct local .env values"
+echo "2) Start backend services:"
 echo "   docker compose up --build"
-echo "2) Run GUI (new shell, same venv):"
+echo "3) Verify Ollama models exist (step 5)"
+echo "4) Run GUI (new shell, same venv):"
 echo "   python -m src.GUI.gui_main"
 echo
 echo "If qwen3-tts fails with missing model/tokenizer assets, set HF_TOKEN before docker compose:"

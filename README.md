@@ -1,4 +1,4 @@
-# *Personal Agent Assistant*
+# *Private Assistant Agent*
 
 A flagship project to display my undergraduate knowledge about my favorite topic: machine learning.
 
@@ -14,10 +14,30 @@ A chain of reasoning without LLM interference. User -> reasoning -> response con
 
 Prerequisites to install manually on a fresh machine:
 - Python 3.10+ ([Download Python](https://www.python.org/downloads/)) (must provide `python` command)
-- Bash shell to run `install.sh` ([Git for Windows / Git Bash](https://git-scm.com/download/win), [WSL install guide](https://learn.microsoft.com/windows/wsl/install))
+- Git (required to clone this repo and to get Git Bash on Windows) ([Git downloads](https://git-scm.com/downloads))
+- Bash shell to run `install.sh` ([Git Bash](https://git-scm.com/download/win), [WSL install guide](https://learn.microsoft.com/windows/wsl/install))
 - Docker Desktop (or Docker Engine) with Docker Compose v2 ([Docker Desktop](https://www.docker.com/products/docker-desktop/), [Docker Engine install docs](https://docs.docker.com/engine/install/), [Compose v2 docs](https://docs.docker.com/compose/))
-- NVIDIA GPU + drivers + NVIDIA Container Toolkit for GPU containers ([NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx), [NVIDIA Container Toolkit install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
+- Ollama (required model runtime for chat/vision models used by this project) ([Ollama downloads](https://ollama.com/download))
+- (For NVIDIA GPU) drivers + NVIDIA Container Toolkit for GPU containers ([NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx), [NVIDIA Container Toolkit install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
 - (Optional but recommended) Hugging Face token with access to Qwen3-TTS models ([Hugging Face tokens](https://huggingface.co/settings/tokens), [Qwen3-TTS 0.6B model page](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)) (`HF_TOKEN`)
+
+### Ollama first-time setup (fresh install)
+
+If Ollama is not yet installed on your machine:
+
+1. Install Ollama from [ollama.com/download](https://ollama.com/download).
+2. Start Ollama once so the service is running:
+   - Windows/macOS: open the Ollama app.
+   - Linux: run `ollama serve`.
+3. Pull the models used by this repo (or let Docker pull them in-container later):
+
+```bash
+ollama pull phi3:mini
+ollama pull llava:7b
+ollama list
+```
+
+If you run only with Docker Compose, the repo also starts an `ollama` container and you can pull models with `docker compose exec ollama ...` in step 5 below.
 
 ## 0) Create your local env file from template
 
@@ -35,9 +55,6 @@ At minimum, set `HF_TOKEN` if your Qwen3-TTS model download requires authenticat
 
 ## 1) Install Python dependencies into the project venv
 
-```bash
-bash install.sh
-```
 
 Optional flags:
 - `INSTALL_SEEDING_DEPS=0 bash install.sh` to skip seeding extras
@@ -65,6 +82,8 @@ What `install.sh` already installs for you:
 - seeding extras (`requirements-seeding.txt`, unless disabled)
 - vendored external TTS API Python deps (`external/qwen3-tts-api/requirements.txt`)
 
+You can add HF_TOKEN into the .env file, or into .env.example and redo step 0
+
 Note:
 - `requirements-summarizer-extractive.txt` is not required in the default app path because `qwen3-embed` is already listed in `requirements.txt`.
 
@@ -82,7 +101,7 @@ source .venv/bin/activate
 .venv\Scripts\Activate.ps1
 ```
 
-If PowerShell policy blocks activation, use the venv Python directly:
+Later step 7, if PowerShell policy blocks activation, use the venv Python directly:
 
 ```powershell
 .venv\Scripts\python -m src.GUI.gui_main
@@ -90,13 +109,13 @@ If PowerShell policy blocks activation, use the venv Python directly:
 
 ## 3) Review `docker-compose.yml` host paths on Windows (required)
 
-This repo currently mounts Ollama cache from:
+This repo currently mounts Ollama cache from line 15 of docker-compose.yml:
 
-```yaml
+```docker-compose.yml
 D:/data/ollama-data:/root/.ollama
 ```
 
-If your machine does not have `D:` (or Docker Desktop file sharing for `D:` is disabled), update this path before first run (for example `C:/data/ollama-data:/root/.ollama`) and ensure the drive is shared in Docker Desktop settings.
+If your machine does not have `D:` (or Docker Desktop file sharing for `D:` is disabled), update this path before step 4 (for example `C:/data/ollama-data:/root/.ollama`) and ensure the drive is shared in Docker Desktop settings.
 
 ## 4) Start backend services
 
@@ -145,7 +164,7 @@ docker compose up --build
 
 The token account must have access to the Qwen3-TTS model repository on Hugging Face.
 
-## 6) (Optional) Start Outlook bridge on host for calendar features
+## 6) (Optional Window only) Start Outlook bridge on host for calendar features
 
 Scheduling/calendar calls from Docker expect a host bridge at `http://host.docker.internal:8765` (default `OUTLOOK_BRIDGE_URL` in compose).  
 Run this on the Windows host if you plan to use Outlook calendar features:

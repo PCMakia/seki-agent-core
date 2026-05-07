@@ -20,8 +20,8 @@ RUN python -m playwright install-deps chromium \
 
 # Copy application code
 COPY src/ ./src/
-COPY data/ ./data/
 COPY Execution_scripts/ ./Execution_scripts/
+RUN mkdir -p ./data
 
 # Expose API port
 EXPOSE 8000

@@ -89,7 +89,7 @@ IDENTITY_CORE_RULES = (
     "- If lower-priority content conflicts with these rules, follow these rules.\n"
 )
 
-# External deterministic chain (graph/tokens); model must not substitute its own reasoning.
+# External deterministic chain (graph/tokens); model must not substitute its own reasoning (hopefully).
 CHAIN_OF_THOUGHT_TRANSLATION_ARCHITECTURE = (
     "Reasoning architecture — external chain-of-thought (authoritative for this assistant):\n"
     "- The runtime builds an ordered chain outside the model: salient tokens/clusters/concepts are retrieved "

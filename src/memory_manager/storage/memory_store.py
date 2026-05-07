@@ -1,3 +1,5 @@
+""" Adapter for SQL table interaction
+"""
 from __future__ import annotations
 
 import json

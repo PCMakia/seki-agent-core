@@ -50,3 +50,31 @@
 - `notify_user.py` — Best-effort Windows toast notifications for reminders.
 - `create_alarm.py` — Simple local alarm countdown + audible fallback signals.
 - `calender_add_event.py` — Minimal standalone Outlook COM test script for creating an appointment item.
+
+## `Execution_scripts/`
+
+- `ollama_docker_entrypoint.sh` — Container entrypoint script for Ollama-related startup flow.
+- `outlook_bridge_server.py` — Bridge server script used to expose Outlook integration endpoints.
+
+## `external/`
+
+### `external/qwen3-tts-api/`
+
+- `main.py` — Top-level launch entrypoint.
+
+### `external/qwen3-tts-api/app/`
+
+- `config.py` — Runtime/configuration settings.
+- `main.py` — Application bootstrap for the API service.
+- `models.py` — Data models used by the app/API.
+- `tts_model.py` — TTS model loading/inference integration.
+
+### `external/qwen3-tts-api/app/api/`
+
+- `router.py` — Aggregates and mounts API route modules.
+
+### `external/qwen3-tts-api/app/api/endpoints/`
+
+- `health.py` — Health/readiness API endpoint(s).
+- `speech.py` — Speech generation API endpoint(s).
+- `voices.py` — Voice listing/selection API endpoint(s).

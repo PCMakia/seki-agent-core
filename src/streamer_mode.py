@@ -1,3 +1,8 @@
+""" EXPERIMENTAL
+    Streaming feature: capturing a frame through OBS the moment mobile client STT is sent
+    Processing both to get the idea what user is talking about
+"""
+
 from __future__ import annotations
 
 import asyncio

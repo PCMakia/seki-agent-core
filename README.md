@@ -182,6 +182,30 @@ After the backend is running, launch the desktop chat GUI:
 ```bash
 python -m src.GUI.gui_main
 ```
+## 8) (Optional upgrade) Upgrade memory into Facebook AI Similarity Search (Faiss_index) graph memory
+
+Build cluster
+```bash
+python -m src.memory_manager.storage.graph_cluster_build --memory-db-dir data --link-heads
+```
+
+Embedding
+```bash
+python -m src.memory_manager.storage.embedding_backfill --memory-db-dir data
+```
+Create index file
+```bash
+python -c "from src.memory_manager.storage.memory_store import MemoryStore; from src.memory_manager.storage.faiss_index import build_faiss_flatip_index_from_db; store=MemoryStore(); build_faiss_flatip_index_from_db(store=store); print('faiss index built')"
+```
+
+
+Ways to populate database:
+- Chat with agent
+- seed from docx
+```bash
+python -m src.memory_manager.storage.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
+```
+
 
 Optional environment variables for `agent-framework`:
 - `AGENT_BASE_URL`: defaults to `http://localhost:8000` (GUI side)
@@ -213,7 +237,7 @@ python -m src.GUI.gui_main
 ```bash
 docker compose down
 ```
-# Details
+# Extra Details
 
 ### API responses
 
@@ -300,7 +324,7 @@ Agent: hello! how can I help you today?
 
 By default logs are written to `data/logs/` inside the container, which is mounted from the host via `./data:/app/data` in `docker-compose.yml`. You can override the log directory by setting the `CHAT_LOG_DIR` environment variable (default `data/logs`).
 
-### Streamer mode (voice + OBS screen commentary)
+### EXPERIMENTAL: Streamer mode (voice + OBS screen commentary)
 
 Streamer mode combines voice segments with OBS screen capture and a vision model:
 
@@ -367,29 +391,6 @@ Each variable (for example `fg_color`) has two values: index 0 is light theme, i
 "fg_color": ["#176109", "#0b2404"]
 ```
 
-
-### FAISS index (upgrade to graph database)
-Build cluster
-```bash
-python -m src.memory_manager.storage.graph_cluster_build --memory-db-dir data --link-heads
-```
-
-Embedding
-```bash
-python -m src.memory_manager.storage.embedding_backfill --memory-db-dir data
-```
-Create index file
-```bash
-python -c "from src.memory_manager.storage.memory_store import MemoryStore; from src.memory_manager.storage.faiss_index import build_faiss_flatip_index_from_db; store=MemoryStore(); build_faiss_flatip_index_from_db(store=store); print('faiss index built')"
-```
-
-
-Ways to populate database:
-- Chat with agent
-- seed from docx
-```bash
-python -m src.memory_manager.storage.memory_seeding --inputs "path/to/file.docx" --memory-db-dir data
-```
 
 # Change log
 ### V1.0: IMPORTANT (need fresh install from beta)

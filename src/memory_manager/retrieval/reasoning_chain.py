@@ -1,3 +1,6 @@
+""" Non-LLM reasoning module, text processing methods
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict, deque

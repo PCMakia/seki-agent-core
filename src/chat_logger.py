@@ -1,3 +1,5 @@
+""" Legacy script: create JSONL log for rounds of conversation
+"""
 from pathlib import Path
 import json
 import os

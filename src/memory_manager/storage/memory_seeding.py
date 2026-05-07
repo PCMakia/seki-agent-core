@@ -1,3 +1,7 @@
+""" A script to use the docx file to populate the nodes memory 
+    (more in README\Extra Details)
+"""
+
 from __future__ import annotations
 
 import argparse

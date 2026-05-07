@@ -1,3 +1,6 @@
+""" Outlook interactive
+    Script to create event in Classic Outlook (need bridge - in Execution_scripts - online)
+"""
 from __future__ import annotations
 
 import json

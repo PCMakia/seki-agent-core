@@ -1,3 +1,11 @@
+# seki-agent-core
+
+Core agent runtime extracted from Personal-Assistant: non-LLM reasoning chain, SQLite knowledge graph, FAISS retrieval, tool loops, and FastAPI orchestration.
+
+Sibling repos now own the GUI (`seki-gui`), TTS (`seki-tts`), and model serving (`seki-inference-engine`). Original notes below.
+
+---
+
 # *Private Assistant Agent*
 
 A flagship project to display my undergraduate knowledge about my favorite topic: machine learning.

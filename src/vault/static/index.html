@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Seki vault</title>
+  <link rel="stylesheet" href="./vault.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>Vault</h1>
+      <p>Local concept graph · agent-core SQLite</p>
+    </div>
+    <div class="toolbar">
+      <label>Hours <input id="hours" type="number" min="0" max="720" value="24" /></label>
+      <label>Session <input id="session" type="text" value="default" spellcheck="false" /></label>
+      <button id="reload" type="button">Reload</button>
+      <span id="stats" class="stats"></span>
+    </div>
+  </header>
+  <main class="layout">
+    <aside class="pane left">
+      <input id="search" type="search" placeholder="Search notes…" />
+      <h2>Hottest</h2>
+      <ul id="hot-nodes" class="list"></ul>
+      <h2>Hot links</h2>
+      <ul id="hot-edges" class="list"></ul>
+    </aside>
+    <section class="canvas-wrap">
+      <canvas id="graph"></canvas>
+      <p id="hint" class="hint">Drag nodes · click a note to inspect · empty graph means no activations yet</p>
+    </section>
+    <aside class="pane right" id="inspector">
+      <p class="muted">Select a note on the graph or from Hottest.</p>
+    </aside>
+  </main>
+  <section class="chain">
+    <h2>Chain used this turn</h2>
+    <pre id="chain">No chain captured yet. Send a GUI or Discord reply, then reload.</pre>
+  </section>
+  <dialog id="episode-dialog">
+    <form method="dialog">
+      <header>
+        <h3 id="ep-title">Episode</h3>
+        <button value="close" type="submit">Close</button>
+      </header>
+      <div id="ep-body"></div>
+    </form>
+  </dialog>
+  <script src="./vault.js"></script>
+</body>
+</html>

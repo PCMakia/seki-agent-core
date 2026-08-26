@@ -127,6 +127,15 @@ CREATE TABLE IF NOT EXISTS unresolved (
 
 CREATE INDEX IF NOT EXISTS idx_unresolved_status_fire
   ON unresolved(status, reminder_fire_at_ts);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_activation
+  ON nodes(activation_weight DESC);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_last_activation
+  ON nodes(last_activation_ts);
+
+CREATE INDEX IF NOT EXISTS idx_edges_coactivation
+  ON edges(last_coactivation_ts);
 """
 
 
@@ -168,6 +177,29 @@ class MemoryStore:
                 (session_id, ts, user_text, assistant_text, topic, float(importance), usage_json),
             )
             return int(cur.lastrowid)
+
+    def fetch_last_episode_meta(self, session_id: str) -> dict[str, str] | None:
+        """Newest episode for a session (timestamp + last user text), or None."""
+        sid = (session_id or "").strip()
+        if not sid:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ts, user_text
+                FROM episodes
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (sid,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "ts": str(row["ts"] or ""),
+            "user_text": str(row["user_text"] or ""),
+        }
 
     def upsert_entity(self, *, name: str, type_: str = "unknown") -> int:
         name = (name or "").strip()
@@ -637,6 +669,422 @@ class MemoryStore:
         params: list[object] = [ts, *ids]
         with self._connect() as conn:
             conn.execute(sql, params)
+
+    def bump_node_activation(
+        self,
+        node_ids: Iterable[int],
+        *,
+        delta: float = 1.0,
+        ts: str | None = None,
+    ) -> None:
+        """Raise activation for nodes that fired (chain / consolidation)."""
+        ids = sorted({int(i) for i in node_ids if int(i) > 0})
+        if not ids:
+            return
+        now_ts = ts or _utc_now_iso()
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE nodes
+                SET activation_weight = COALESCE(activation_weight, 0.0) + ?,
+                    last_activation_ts = ?
+                WHERE id IN ({placeholders})
+                """,
+                (float(delta), now_ts, *ids),
+            )
+
+    def vault_stats(self) -> dict[str, int]:
+        with self._connect() as conn:
+            nodes = int(conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+            edges = int(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0])
+            episodes = int(conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0])
+        return {"nodes": nodes, "edges": edges, "episodes": episodes}
+
+    def list_nodes(
+        self,
+        *,
+        q: str = "",
+        type_: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[sqlite3.Row], int]:
+        query = (q or "").strip().lower()
+        type_f = (type_ or "").strip().lower()
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        where: list[str] = ["1=1"]
+        params: list[object] = []
+        if query:
+            like = f"%{query}%"
+            where.append("(LOWER(name) LIKE ? OR LOWER(summary) LIKE ?)")
+            params.extend([like, like])
+        if type_f:
+            where.append("LOWER(type) = ?")
+            params.append(type_f)
+        clause = " AND ".join(where)
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM nodes WHERE {clause}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = list(
+                conn.execute(
+                    f"""
+                    SELECT id, name, type, summary, activation_weight, last_activation_ts
+                    FROM nodes
+                    WHERE {clause}
+                    ORDER BY activation_weight DESC, name COLLATE NOCASE ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    [*params, limit, offset],
+                ).fetchall()
+            )
+        return rows, total
+
+    def get_node(self, node_id: int) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, name, type, summary, activation_weight, last_activation_ts
+                FROM nodes
+                WHERE id = ?
+                """,
+                (int(node_id),),
+            ).fetchone()
+
+    def node_degree(self, node_id: int) -> int:
+        nid = int(node_id)
+        with self._connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE src_id = ? OR dst_id = ?",
+                    (nid, nid),
+                ).fetchone()[0]
+            )
+
+    def patch_node_summary(self, node_id: int, summary: str) -> bool:
+        text = (summary or "").strip()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE nodes SET summary = ? WHERE id = ?",
+                (text, int(node_id)),
+            )
+            return cur.rowcount > 0
+
+    def fetch_neighbors(self, node_id: int, *, limit: int = 80) -> list[sqlite3.Row]:
+        nid = int(node_id)
+        limit = max(1, min(int(limit), 200))
+        with self._connect() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT
+                        e.id AS edge_id,
+                        e.src_id,
+                        s.name AS src_name,
+                        e.dst_id,
+                        d.name AS dst_name,
+                        e.relation_type,
+                        e.weight,
+                        e.last_coactivation_ts,
+                        CASE WHEN e.src_id = ? THEN 'out' ELSE 'in' END AS direction
+                    FROM edges e
+                    JOIN nodes s ON s.id = e.src_id
+                    JOIN nodes d ON d.id = e.dst_id
+                    WHERE e.src_id = ? OR e.dst_id = ?
+                    ORDER BY e.weight DESC
+                    LIMIT ?
+                    """,
+                    (nid, nid, nid, limit),
+                ).fetchall()
+            )
+
+    def list_episodes(
+        self,
+        *,
+        q: str = "",
+        session_id: str = "",
+        limit: int = 30,
+        offset: int = 0,
+    ) -> tuple[list[sqlite3.Row], int]:
+        query = (q or "").strip()
+        sid = (session_id or "").strip()
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        where: list[str] = ["1=1"]
+        params: list[object] = []
+        if sid:
+            where.append("session_id = ?")
+            params.append(sid)
+        if query:
+            like = f"%{query}%"
+            where.append("(user_text LIKE ? OR assistant_text LIKE ? OR IFNULL(topic,'') LIKE ?)")
+            params.extend([like, like, like])
+        clause = " AND ".join(where)
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM episodes WHERE {clause}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = list(
+                conn.execute(
+                    f"""
+                    SELECT id, session_id, ts, user_text, assistant_text, topic, importance
+                    FROM episodes
+                    WHERE {clause}
+                    ORDER BY ts DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    [*params, limit, offset],
+                ).fetchall()
+            )
+        return rows, total
+
+    def get_episode(self, episode_id: int) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, session_id, ts, user_text, assistant_text, topic, importance
+                FROM episodes
+                WHERE id = ?
+                """,
+                (int(episode_id),),
+            ).fetchone()
+
+    def fetch_episodes_for_node(self, node_id: int, *, limit: int = 20) -> list[sqlite3.Row]:
+        node = self.get_node(node_id)
+        if node is None:
+            return []
+        name = str(node["name"] or "").strip()
+        limit = max(1, min(int(limit), 50))
+        like = f"%{name}%" if name else ""
+        with self._connect() as conn:
+            linked = list(
+                conn.execute(
+                    """
+                    SELECT DISTINCT
+                        ep.id, ep.session_id, ep.ts, ep.user_text, ep.assistant_text, ep.topic, ep.importance
+                    FROM episodes ep
+                    JOIN episode_entities ee ON ee.episode_id = ep.id
+                    JOIN entities ent ON ent.id = ee.entity_id
+                    JOIN nodes n
+                      ON LOWER(n.name) = LOWER(ent.name)
+                     AND LOWER(n.type) = LOWER(ent.type)
+                    WHERE n.id = ?
+                    ORDER BY ep.ts DESC, ep.id DESC
+                    LIMIT ?
+                    """,
+                    (int(node_id), limit),
+                ).fetchall()
+            )
+            if len(linked) >= limit or not like:
+                return linked
+            seen = {int(r["id"]) for r in linked}
+            extra = list(
+                conn.execute(
+                    """
+                    SELECT id, session_id, ts, user_text, assistant_text, topic, importance
+                    FROM episodes
+                    WHERE user_text LIKE ? OR assistant_text LIKE ?
+                    ORDER BY ts DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (like, like, limit),
+                ).fetchall()
+            )
+        out = list(linked)
+        for row in extra:
+            eid = int(row["id"])
+            if eid in seen:
+                continue
+            seen.add(eid)
+            out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
+    def create_edge(
+        self,
+        *,
+        src_id: int,
+        dst_id: int,
+        relation_type: str = "co_occurs",
+        weight: float = 1.0,
+    ) -> sqlite3.Row | None:
+        src = int(src_id)
+        dst = int(dst_id)
+        if src <= 0 or dst <= 0 or src == dst:
+            return None
+        if self.get_node(src) is None or self.get_node(dst) is None:
+            return None
+        rel = (relation_type or "co_occurs").strip().lower() or "co_occurs"
+        self.upsert_edge(
+            src_id=src,
+            dst_id=dst,
+            relation_type=rel,
+            weight_delta=float(weight),
+        )
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT
+                    e.id, e.src_id, s.name AS src_name, e.dst_id, d.name AS dst_name,
+                    e.relation_type, e.weight, e.last_coactivation_ts
+                FROM edges e
+                JOIN nodes s ON s.id = e.src_id
+                JOIN nodes d ON d.id = e.dst_id
+                WHERE e.src_id = ? AND e.dst_id = ? AND e.relation_type = ?
+                """,
+                (src, dst, rel),
+            ).fetchone()
+
+    def delete_edge(self, edge_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM edges WHERE id = ?", (int(edge_id),))
+            return cur.rowcount > 0
+
+    def hottest_nodes(self, *, since_ts: str | None = None, limit: int = 40) -> list[sqlite3.Row]:
+        limit = max(1, min(int(limit), 200))
+        sql = """
+            SELECT id, name, type, summary, activation_weight, last_activation_ts
+            FROM nodes
+        """
+        params: list[object] = []
+        if since_ts:
+            sql += " WHERE last_activation_ts IS NOT NULL AND last_activation_ts >= ?"
+            params.append(since_ts)
+        sql += " ORDER BY activation_weight DESC, name COLLATE NOCASE ASC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = list(conn.execute(sql, params).fetchall())
+        if rows and all(float(r["activation_weight"] or 0.0) <= 0.0 for r in rows):
+            seeded = self._nodes_from_hot_edges(since_ts=since_ts, limit=limit)
+            if seeded:
+                return seeded
+        return rows
+
+    def _nodes_from_hot_edges(self, *, since_ts: str | None, limit: int) -> list[sqlite3.Row]:
+        edges = self.hottest_edges(since_ts=since_ts, limit=max(limit, 20))
+        if since_ts and len(edges) < 4:
+            edges = self.hottest_edges(since_ts=None, limit=max(limit, 20))
+        ids: list[int] = []
+        seen: set[int] = set()
+        for edge in edges:
+            for nid in (int(edge["src_id"]), int(edge["dst_id"])):
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                ids.append(nid)
+                if len(ids) >= limit:
+                    break
+            if len(ids) >= limit:
+                break
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            found = list(
+                conn.execute(
+                    f"""
+                    SELECT id, name, type, summary, activation_weight, last_activation_ts
+                    FROM nodes WHERE id IN ({placeholders})
+                    """,
+                    ids,
+                ).fetchall()
+            )
+        order = {nid: i for i, nid in enumerate(ids)}
+        found.sort(key=lambda r: order.get(int(r["id"]), 10_000))
+        return found
+
+    def hottest_edges(self, *, since_ts: str | None = None, limit: int = 40) -> list[sqlite3.Row]:
+        limit = max(1, min(int(limit), 200))
+        sql = """
+            SELECT
+                e.id, e.src_id, s.name AS src_name, e.dst_id, d.name AS dst_name,
+                e.relation_type, e.weight, e.last_coactivation_ts
+            FROM edges e
+            JOIN nodes s ON s.id = e.src_id
+            JOIN nodes d ON d.id = e.dst_id
+        """
+        params: list[object] = []
+        if since_ts:
+            sql += " WHERE e.last_coactivation_ts IS NOT NULL AND e.last_coactivation_ts >= ?"
+            params.append(since_ts)
+        sql += " ORDER BY e.weight DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return list(conn.execute(sql, params).fetchall())
+
+    def graph_slice(
+        self,
+        *,
+        center_id: int | None = None,
+        since_ts: str | None = None,
+        limit: int = 50,
+        q: str = "",
+    ) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+        """Nodes + edges among them for the vault canvas."""
+        limit = max(2, min(int(limit), 120))
+        if center_id:
+            center = self.get_node(int(center_id))
+            if center is None:
+                return [], []
+            neighbors = self.fetch_neighbors(int(center_id), limit=limit)
+            ids = {int(center_id)}
+            for row in neighbors:
+                ids.add(int(row["src_id"]))
+                ids.add(int(row["dst_id"]))
+            nodes = [center]
+            extra_ids = [i for i in ids if i != int(center_id)]
+            if extra_ids:
+                placeholders = ",".join("?" for _ in extra_ids)
+                with self._connect() as conn:
+                    nodes.extend(
+                        conn.execute(
+                            f"""
+                            SELECT id, name, type, summary, activation_weight, last_activation_ts
+                            FROM nodes WHERE id IN ({placeholders})
+                            """,
+                            extra_ids,
+                        ).fetchall()
+                    )
+            edges = neighbors
+            return nodes, edges
+
+        query = (q or "").strip()
+        if query:
+            nodes, _total = self.list_nodes(q=query, limit=limit, offset=0)
+        else:
+            nodes = self.hottest_nodes(since_ts=since_ts, limit=limit)
+            if since_ts and len(nodes) < 8:
+                nodes = self.hottest_nodes(since_ts=None, limit=limit)
+        ids = [int(r["id"]) for r in nodes]
+        if not ids:
+            return [], []
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            edges = list(
+                conn.execute(
+                    f"""
+                    SELECT
+                        e.id, e.src_id, s.name AS src_name, e.dst_id, d.name AS dst_name,
+                        e.relation_type, e.weight, e.last_coactivation_ts
+                    FROM edges e
+                    JOIN nodes s ON s.id = e.src_id
+                    JOIN nodes d ON d.id = e.dst_id
+                    WHERE e.src_id IN ({placeholders}) AND e.dst_id IN ({placeholders})
+                    ORDER BY e.weight DESC
+                    LIMIT ?
+                    """,
+                    [*ids, *ids, limit * 4],
+                ).fetchall()
+            )
+        return nodes, edges
 
     def decay_graph(self, *, decay: float = 0.98, min_weight: float = 0.05) -> None:
         """Apply simple decay-based forgetting to node activations and edge weights."""

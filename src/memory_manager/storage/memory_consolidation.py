@@ -99,7 +99,7 @@ class ConsolidationWorker:
                     processed_ids.append(ep_id)
                     continue
 
-                node_ids = self._upsert_nodes(unique_tokens)
+                node_ids = self._upsert_nodes(unique_tokens, now_ts=now_ts)
 
                 # Link this episode to its selected concept nodes so retrieval can
                 # assemble evidence deterministically from `episode_entities`.
@@ -143,11 +143,13 @@ class ConsolidationWorker:
                 break
         return out
 
-    def _upsert_nodes(self, tokens: Iterable[str]) -> list[int]:
+    def _upsert_nodes(self, tokens: Iterable[str], now_ts: str | None = None) -> list[int]:
         node_ids: list[int] = []
         for tok in tokens:
             node_id = self.store.upsert_node(name=tok, type_="concept")
             node_ids.append(node_id)
+        if node_ids:
+            self.store.bump_node_activation(node_ids, delta=1.0, ts=now_ts)
         return node_ids
 
     def _upsert_cooccurrence_edges(self, node_ids: list[int], ts: str) -> None:

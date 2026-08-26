@@ -181,7 +181,13 @@ class ReasoningChainEngine:
             cfg=GraphRetrieverConfig(),
         )
 
-    def build_chain(self, *, session_id: str, text: str) -> ReasoningChainResult:
+    def build_chain(
+        self,
+        *,
+        session_id: str,
+        text: str,
+        write_cache: bool = True,
+    ) -> ReasoningChainResult:
         sid = (session_id or "default").strip() or "default"
         user_text = (text or "").strip()
         raw_tokens = tokenize(user_text)
@@ -315,7 +321,7 @@ class ReasoningChainEngine:
         )
 
         heads = [(s.node_id, s.name) for s in concept_steps[: self.cfg.topic_head_size] if s.node_id]
-        if heads:
+        if heads and write_cache:
             self.cache.put(session_id=sid, heads=heads)
 
         cache_hits = sum(

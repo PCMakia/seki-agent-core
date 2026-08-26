@@ -314,21 +314,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--translate-model",
-        default="qwen3:4b",
-        help="Model passed to LLMClient when --translate is enabled.",
+        default=None,
+        help="Model passed to LLMClient when --translate is enabled. Default: INFERENCE_MODEL.",
     )
     parser.add_argument(
         "--translate-base-url",
         default=None,
-        help="Optional Ollama base URL override for translation.",
+        help="Optional inference gateway base URL override (OpenAI-compatible, includes /v1).",
     )
     parser.add_argument(
         "--translate-timeout",
         type=float,
         default=None,
         help=(
-            "HTTP timeout (seconds) for each Ollama request during --translate. "
-            "Default: OLLAMA_SEED_TIMEOUT env or 600 (longer than chat; avoids httpx.ReadTimeout on slow loads)."
+            "HTTP timeout (seconds) for each inference request during --translate. "
+            "Default: OLLAMA_SEED_TIMEOUT env or 600 (longer than chat)."
         ),
     )
     parser.add_argument(

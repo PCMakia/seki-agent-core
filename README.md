@@ -2,7 +2,14 @@
 
 Core agent runtime extracted from Personal-Assistant: non-LLM reasoning chain, SQLite knowledge graph, FAISS retrieval, tool loops, and FastAPI orchestration.
 
-Sibling repos now own the GUI (`seki-gui`), TTS (`seki-tts`), and model serving (`seki-inference-engine`). Original notes below.
+LLM completions go to **seki-inference-engine** (`INFERENCE_URL`, OpenAI-compatible). Sibling repos own the GUI (`seki-gui`), TTS (`seki-tts`), and model serving.
+
+```powershell
+# .env
+INFERENCE_URL=http://localhost:8000/v1
+INFERENCE_API_KEY=change-me
+INFERENCE_MODEL=Qwen/Qwen2.5-3B-Instruct
+```
 
 ---
 

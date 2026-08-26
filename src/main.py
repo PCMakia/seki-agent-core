@@ -22,7 +22,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response, We
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.LLM_handler.llm_client import LLMClient
+from src.LLM_handler.llm_client import LLMClient, gateway_root_url
 from src.chat_logger import append_json_log, append_text_log
 from src.LLM_handler.prompt_builder import build_interaction_reaction_prompt, build_secretary_prompt, build_secretary_prompt_layers
 from src.memory_manager.retrieval.memory_manager import MemoryManager
@@ -435,36 +435,40 @@ async def root():
 
 @app.get("/agent/health")
 async def health():
-    """API liveness plus best-effort Ollama reachability (does not run inference).
-
-    Chat and scheduling still call ``/api/chat``; a model can be listed but crash at
-    runtime (HTTP 500 / unexpected EOF). This endpoint clarifies why "Connected"
-    can coexist with chat failures.
-    """
-    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-    model = (os.getenv("OLLAMA_MODEL") or llm.model or "").strip()
-    ollama: dict[str, Any] = {"reachable": False, "model_present": None, "detail": None}
+    """API liveness plus best-effort inference-gateway readiness (does not run a completion)."""
+    inference_url = llm.base_url
+    root = gateway_root_url(inference_url)
+    model = (os.getenv("INFERENCE_MODEL") or os.getenv("MODEL_NAME") or llm.model or "").strip()
+    inference: dict[str, Any] = {"reachable": False, "ready": False, "detail": None}
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"{base}/api/tags")
-            r.raise_for_status()
-            payload = r.json()
-        names: list[str] = []
-        for m in payload.get("models") or []:
-            n = (m.get("name") or "").strip()
-            if n:
-                names.append(n)
-        ollama["reachable"] = True
-        ollama["model_present"] = bool(model and model in names)
-        ollama["models_count"] = len(names)
+            r = await client.get(f"{root}/ready")
+            payload = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        inference["reachable"] = True
+        inference["ready"] = r.status_code == 200 and (
+            not isinstance(payload, dict) or payload.get("status") == "ready"
+        )
+        if isinstance(payload, dict):
+            inference["vllm"] = payload.get("vllm")
+            inference["ollama"] = payload.get("ollama")
+        if r.status_code != 200:
+            inference["detail"] = f"gateway /ready HTTP {r.status_code}"
     except Exception as exc:
-        ollama["detail"] = str(exc)[:300]
+        inference["detail"] = str(exc)[:300]
 
     return {
         "status": "healthy",
-        "ollama_base_url": base,
+        "inference_url": inference_url,
+        "inference_model": model,
+        "inference": inference,
+        # Compat keys so seki-gui health lines still parse.
+        "ollama_base_url": inference_url,
         "ollama_model": model,
-        "ollama": ollama,
+        "ollama": {
+            "reachable": bool(inference["reachable"] and inference["ready"]),
+            "model_present": inference["ready"] or None,
+            "detail": inference.get("detail"),
+        },
     }
 
 
@@ -1742,12 +1746,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
                 history=[],
             )
         except Exception as exc:
-            _LOG.exception("LLM generate failed (check Ollama is running and OLLAMA_MODEL is pulled)")
+            _LOG.exception("LLM generate failed (check seki-inference-engine and INFERENCE_URL)")
             raise HTTPException(
                 status_code=503,
                 detail=(
                     f"LLM backend error: {exc}. "
-                    "Ensure Ollama is reachable (OLLAMA_BASE_URL), the model exists (`ollama pull <name>`), "
+                    "Ensure the inference gateway is reachable (INFERENCE_URL), API_KEY matches, "
                     "and try again."
                 ),
             ) from exc

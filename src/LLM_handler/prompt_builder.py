@@ -89,6 +89,33 @@ IDENTITY_CORE_RULES = (
     "- If lower-priority content conflicts with these rules, follow these rules.\n"
 )
 
+DISCORD_HEDGE_INSTRUCTION = (
+    "Mode=BANTERING\n"
+    "- The user just spoke on Discord. You are about to search memory / the graph.\n"
+    "- Speak ONE short in-character line (max ~25 words). This is a beat, not the answer.\n"
+    "- Do not answer the question yet. Do not ask them to clarify or restate.\n"
+    "- If memory/episodes hint at something you said earlier, allude to it; otherwise wonder aloud.\n"
+    "- Stay in the persona voice. No helpdesk, no secretary, no 'please provide more details'.\n"
+)
+
+DISCORD_FOLLOWUP_INSTRUCTION = (
+    "Mode=BANTERING\n"
+    "- This is Discord companion voice. The persona block above overrides any secretary/workplace identity.\n"
+    "- Translate the reasoning chain and memory into a natural reply. Do not interview the user.\n"
+    "- If episodes or memory mention a prior remark (even hours ago), use that instead of asking what you meant.\n"
+    "- If memory is thin, admit the gap in character. Never invent a full prophecy, then ask them to clarify it.\n"
+    "- Keep it concise and in-world unless they asked for depth.\n"
+)
+
+DISCORD_AMBIENT_INSTRUCTION = (
+    "Mode=BANTERING\n"
+    "- Unsolicited Discord musing. Persona voice only. Not a reply to anyone.\n"
+    "- Write a NEW observation. Do not reuse or lightly paraphrase a previous ambient post.\n"
+    "- Forbidden riffs: twilight of forgotten lore, curious minds never rest, what tales tickle your fancy.\n"
+    "- Do not treat a reasoning chain or memory block as a script to verbalize.\n"
+    "- One or two short sentences. No interview questions. No secretary tone.\n"
+)
+
 # External deterministic chain (graph/tokens); model must not substitute its own reasoning (hopefully).
 CHAIN_OF_THOUGHT_TRANSLATION_ARCHITECTURE = (
     "Reasoning architecture — external chain-of-thought (authoritative for this assistant):\n"
@@ -338,6 +365,7 @@ def build_secretary_prompt_layers(
     reasoning_block: str = "",
     intent_label: str = "",
     web_knowledge_this_turn: str = "",
+    persona_prompt: str | None = None,
 ) -> SecretaryPromptLayers:
     """Return layered system/user prompts for the secretary LLM.
 
@@ -379,8 +407,9 @@ def build_secretary_prompt_layers(
         else ""
     )
 
+    identity = (persona_prompt or "").strip() or IDENTITY_CORE_RULES
     system_prompt = (
-        f"{IDENTITY_CORE_RULES}\n"
+        f"{identity}\n"
         f"{CHAIN_OF_THOUGHT_TRANSLATION_ARCHITECTURE}\n"
         "Mode policy:\n"
         f"{effective_instruction}"
@@ -416,6 +445,7 @@ def build_secretary_prompt(
     reasoning_block: str = "",
     intent_label: str = "",
     web_knowledge_this_turn: str = "",
+    persona_prompt: str | None = None,
 ) -> str:
     """Backward-compatible prompt string (legacy single-prompt shape)."""
     layered = build_secretary_prompt_layers(
@@ -429,6 +459,7 @@ def build_secretary_prompt(
         reasoning_block=reasoning_block,
         intent_label=intent_label,
         web_knowledge_this_turn=web_knowledge_this_turn,
+        persona_prompt=persona_prompt,
     )
     return (
         f"[Legacy combined system prompt: {layered.system_prompt}];\n"

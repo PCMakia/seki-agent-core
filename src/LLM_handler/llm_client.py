@@ -59,6 +59,8 @@ def _openai_generation_kwargs(params: Optional[Dict[str, Any]]) -> Dict[str, Any
         out["temperature"] = params["temperature"]
     if params.get("top_p") is not None:
         out["top_p"] = params["top_p"]
+    if params.get("presence_penalty") is not None:
+        out["presence_penalty"] = params["presence_penalty"]
     if params.get("max_tokens") is not None:
         out["max_tokens"] = params["max_tokens"]
     elif params.get("num_predict") is not None:

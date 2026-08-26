@@ -23,7 +23,7 @@ COPY src/ ./src/
 COPY Execution_scripts/ ./Execution_scripts/
 RUN mkdir -p ./data
 
-ENV INFERENCE_URL=http://seki-inference-engine:8000/v1
+ENV INFERENCE_URL=http://seki-v2-inference:8000/v1
 
 # Expose API port
 EXPOSE 8000

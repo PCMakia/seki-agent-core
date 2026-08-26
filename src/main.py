@@ -14,17 +14,26 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.LLM_handler.llm_client import LLMClient, gateway_root_url
 from src.chat_logger import append_json_log, append_text_log
-from src.LLM_handler.prompt_builder import build_interaction_reaction_prompt, build_secretary_prompt, build_secretary_prompt_layers
+from src.LLM_handler.prompt_builder import (
+    DISCORD_FOLLOWUP_INSTRUCTION,
+    DISCORD_HEDGE_INSTRUCTION,
+    DISCORD_AMBIENT_INSTRUCTION,
+    build_interaction_reaction_prompt,
+    build_secretary_prompt,
+    build_secretary_prompt_layers,
+)
 from src.memory_manager.retrieval.memory_manager import MemoryManager
 from src.memory_manager.storage.memory_consolidation import ConsolidationWorker
 from src.RAG_online.summarizer import summarize_round
@@ -36,6 +45,8 @@ from src.task_scheduling import outlook_calendar_side_effect_block, schedule_fro
 from src.tools_external.windows.notify_user import notify_windows_reminder
 from src.streamer_mode import StreamerModeService, StreamerRuntimeConfig
 from src.LLM_handler.reply_sanitize import sanitize_assistant_reply
+from src.vault.last_chain import LastChainBuffer
+from src.vault.router import build_vault_router
 
 _LOG = logging.getLogger("personal_assistant.main")
 
@@ -122,6 +133,8 @@ llm = LLMClient()
 memory = MemoryManager()
 consolidation_worker = ConsolidationWorker(store=memory.store)
 reasoning = ReasoningChainEngine(store=memory.store)
+last_chains = LastChainBuffer()
+VAULT_STATIC = Path(__file__).resolve().parent / "vault" / "static"
 
 
 async def _on_reminder_fire(item: ReminderItem) -> None:
@@ -218,6 +231,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agent Framework API", lifespan=lifespan)
+app.include_router(build_vault_router(lambda: memory.store, last_chains))
+if VAULT_STATIC.is_dir():
+    app.mount("/vault", StaticFiles(directory=str(VAULT_STATIC), html=True), name="vault")
 
 # Simple stack memory (backend-only):
 # - Stores the last 6 role/content turns (user + assistant)
@@ -308,6 +324,10 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     # Optional client tags (e.g. headpat / streaming); same normalization as WebSocket `tags`.
     tags: list[str] | None = Field(default=None)
+    # Discord (and other clients) may supply a live persona that overrides secretary identity.
+    persona_prompt: str | None = None
+    # "hedge" = short in-character beat using memory, no persist. Default is a full reply.
+    phase: str | None = None
 
 
 class ScheduleRequest(BaseModel):
@@ -371,6 +391,19 @@ class PromptDebugResponse(BaseModel):
 class ReasoningChainRequest(BaseModel):
     text: str
     session_id: str | None = None
+
+
+class FocusRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+class FocusResponse(BaseModel):
+    """Cheap working-set snapshot. No LLM. Discord uses this to decide hedge vs one-shot."""
+
+    last_episode_age_sec: float | None = None
+    concept_hits: int = 0
+    cache_hits: int = 0
 
 
 @dataclass
@@ -594,6 +627,21 @@ async def _ws_send_lip_sync_tts(
     await _safe_ws_send(websocket, send_lock, tts)
 
 
+def _episode_age_sec(ts: str | None) -> float | None:
+    raw = (ts or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    from src.time_utils import get_tz, now_dt
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=get_tz())
+    return max(0.0, (now_dt() - dt.astimezone(get_tz())).total_seconds())
+
+
 def _utc_now_iso() -> str:
     # Kept for backward compatibility with existing response fields, but uses
     # the configured app timezone (EST-default) per project plan.
@@ -810,17 +858,24 @@ def _prepare_chat_context(
     session_id: str,
     history: list[dict[str, str]],
     external_event_context: str = "",
+    *,
+    persona_prompt: str | None = None,
+    phase: str | None = None,
+    tags: list[str] | None = None,
 ) -> ChatPreparedContext:
+    tags = tags or []
+    is_announce = "announce" in tags
     discourse = resolve_discourse_for_reasoning(message, history)
     reasoning_input = discourse.reasoning_input.strip() or message.strip()
 
     reasoning_result: ReasoningChainResult | None = None
     reasoning_err: str | None = None
-    try:
-        reasoning_result = reasoning.build_chain(session_id=session_id, text=reasoning_input)
-    except Exception as exc:
-        reasoning_err = str(exc)
-        print(f"[reasoning] Failed to build chain: {exc}")
+    if not is_announce:
+        try:
+            reasoning_result = reasoning.build_chain(session_id=session_id, text=reasoning_input)
+        except Exception as exc:
+            reasoning_err = str(exc)
+            print(f"[reasoning] Failed to build chain: {exc}")
 
     intent_info = classify_intent(message, reasoning_result)
     reasoning_text = format_reasoning_block_text(
@@ -848,18 +903,20 @@ def _prepare_chat_context(
     )
 
     clsm_memory_block = ""
-    try:
-        clsm_memory_block = memory.retrieve_context(
-            session_id=session_id, user_text=reasoning_input
-        ).block
-    except Exception as exc:
-        print(f"[memory] Failed to retrieve context: {exc}")
+    if not is_announce:
+        try:
+            clsm_memory_block = memory.retrieve_context(
+                session_id=session_id, user_text=reasoning_input
+            ).block
+        except Exception as exc:
+            print(f"[memory] Failed to retrieve context: {exc}")
 
     web_knowledge_block = ""
+    is_hedge = (phase or "").strip().lower() == "hedge"
     try:
         from src.RAG_online.jit_web_knowledge import build_jit_web_knowledge_block, jit_web_enabled
 
-        if jit_web_enabled():
+        if jit_web_enabled() and not is_hedge and not is_announce:
             web_knowledge_block = build_jit_web_knowledge_block(
                 user_text=reasoning_input,
                 store=memory.store,
@@ -869,6 +926,20 @@ def _prepare_chat_context(
     except Exception as exc:
         print(f"[jit_web] Failed to build web knowledge block: {exc}")
 
+    persona = (persona_prompt or "").strip() or None
+    if is_hedge:
+        instruction = DISCORD_HEDGE_INSTRUCTION
+        mode = "BANTERING"
+    elif is_announce:
+        instruction = DISCORD_AMBIENT_INSTRUCTION
+        mode = "BANTERING"
+    elif persona:
+        instruction = DISCORD_FOLLOWUP_INSTRUCTION
+        mode = "BANTERING"
+    else:
+        instruction = None
+        mode = None
+
     system_prompt = ""
     if PROMPT_LAYERED:
         layered = build_secretary_prompt_layers(
@@ -877,11 +948,12 @@ def _prepare_chat_context(
             clsm_memory=clsm_memory_block,
             conversation_summary=get_conversation_summary(),
             external_event_context=external_event_context,
-            instruction=None,
-            mode=None,
+            instruction=instruction,
+            mode=mode,
             reasoning_block=reasoning_text,
             intent_label=intent_label,
             web_knowledge_this_turn=web_knowledge_block,
+            persona_prompt=persona,
         )
         prompt = layered.user_prompt
         system_prompt = layered.system_prompt
@@ -892,12 +964,21 @@ def _prepare_chat_context(
             clsm_memory=clsm_memory_block,
             conversation_summary=get_conversation_summary(),
             external_event_context=external_event_context,
-            instruction=None,
-            mode=None,
+            instruction=instruction,
+            mode=mode,
             reasoning_block=reasoning_text,
             intent_label=intent_label,
             web_knowledge_this_turn=web_knowledge_block,
+            persona_prompt=persona,
         )
+    if reasoning_result is not None:
+        last_chains.put(session_id, reasoning_result.to_dict())
+        if not is_hedge and not is_announce:
+            fired = [s.node_id for s in reasoning_result.steps if s.node_id is not None]
+            try:
+                memory.store.bump_node_activation(fired)
+            except Exception as exc:
+                print(f"[vault] activation bump failed: {exc}")
     return ChatPreparedContext(
         session_id=session_id,
         prompt=prompt,
@@ -928,6 +1009,7 @@ def _persist_chat_side_effects(
     usage: dict | None,
     clsm_memory_block: str,
     reasoning_meta: ReasoningMeta,
+    skip_stack_history: bool = False,
 ) -> None:
     try:
         memory.record_usage_metrics(
@@ -939,10 +1021,11 @@ def _persist_chat_side_effects(
     except Exception as exc:
         print(f"[memory] Failed to record usage metrics: {exc}")
 
-    push_message("user", user_message)
-    push_message("assistant", reply)
+    if not skip_stack_history:
+        push_message("user", user_message)
+        push_message("assistant", reply)
 
-    _append_round_summary(user_message, reply)
+        _append_round_summary(user_message, reply)
 
     reasoning_log = reasoning_meta.model_dump()
     try:
@@ -1519,6 +1602,41 @@ async def reasoning_cache_debug(
     return {"session_id": sid, "limit": int(limit), "topic_heads": heads}
 
 
+@app.post("/agent/focus", response_model=FocusResponse)
+async def session_focus(req: FocusRequest):
+    """Read-only: last episode age + whether this query hits the working set.
+
+    Does not call the LLM and does not write the topic-head cache.
+    """
+    session_id = (req.session_id or "default").strip() or "default"
+    last_age: float | None = None
+    try:
+        meta = memory.store.fetch_last_episode_meta(session_id)
+        if meta:
+            last_age = _episode_age_sec(meta.get("ts"))
+    except Exception as exc:
+        print(f"[focus] last-episode lookup failed: {exc}")
+
+    concept_hits = 0
+    cache_hits = 0
+    try:
+        result = reasoning.build_chain(
+            session_id=session_id,
+            text=req.message,
+            write_cache=False,
+        )
+        concept_hits = sum(1 for s in result.steps if s.step_type == "concept")
+        cache_hits = int(result.cache_hits)
+    except Exception as exc:
+        print(f"[focus] chain probe failed: {exc}")
+
+    return FocusResponse(
+        last_episode_age_sec=last_age,
+        concept_hits=concept_hits,
+        cache_hits=cache_hits,
+    )
+
+
 @app.post("/agent/reasoning-chain")
 async def reasoning_chain(req: ReasoningChainRequest):
     """Build deterministic concept reasoning chain from text (no LLM call)."""
@@ -1717,33 +1835,52 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     started_at = time.perf_counter()
     prep_started_at = time.perf_counter()
     try:
-        history = get_history()
         session_id = (req.session_id or "default").strip() or "default"
         tags = _normalize_request_tags(req.tags)
+        phase = (req.phase or "reply").strip().lower()
+        if phase not in {"hedge", "reply"}:
+            raise HTTPException(status_code=400, detail="phase must be hedge or reply")
+        is_hedge = phase == "hedge"
+        is_discord = "discord" in tags
         tags_block = _build_client_tags_context_block(tags)
-        schedule_probe_text = _auto_schedule_tagged_message(req.message)
-        cal_block = await outlook_calendar_side_effect_block(
-            session_id=session_id,
-            user_text=schedule_probe_text,
-            llm=llm,
-            store=memory.store,
-            scheduler=reminder_scheduler,
-        )
+        cal_block = ""
+        if not is_hedge and not is_discord:
+            schedule_probe_text = _auto_schedule_tagged_message(req.message)
+            cal_block = await outlook_calendar_side_effect_block(
+                session_id=session_id,
+                user_text=schedule_probe_text,
+                llm=llm,
+                store=memory.store,
+                scheduler=reminder_scheduler,
+            )
         ext_parts = [p for p in (tags_block, cal_block) if p]
+        history = [] if is_discord else get_history()
         context = _prepare_chat_context(
             message=req.message,
             session_id=session_id,
             history=history,
             external_event_context="\n\n".join(ext_parts),
+            persona_prompt=req.persona_prompt,
+            phase=phase,
+            tags=tags,
         )
         prep_elapsed_ms = int((time.perf_counter() - prep_started_at) * 1000)
 
         llm_started_at = time.perf_counter()
+        gen_kwargs: dict[str, Any] = {}
+        if is_hedge:
+            gen_kwargs["max_tokens"] = 64
+            gen_kwargs["temperature"] = 0.9
+        elif "announce" in tags:
+            gen_kwargs["temperature"] = 1.05
+            gen_kwargs["presence_penalty"] = 0.7
+            gen_kwargs["max_tokens"] = 120
         try:
             result = llm.generate(
                 context.prompt,
                 system_prompt=context.system_prompt or None,
                 history=[],
+                **gen_kwargs,
             )
         except Exception as exc:
             _LOG.exception("LLM generate failed (check seki-inference-engine and INFERENCE_URL)")
@@ -1760,16 +1897,17 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         reply = sanitize_assistant_reply(result["completion"] or "")
         usage = result.get("usage")
 
-        _persist_chat_side_effects(
-            session_id=session_id,
-            user_message=req.message,
-            reply=reply,
-            usage=usage,
-            clsm_memory_block=context.clsm_memory_block,
-            reasoning_meta=context.reasoning_meta,
-        )
-
-        background_tasks.add_task(_run_memory_web_enrich_safe, context.reasoning_result)
+        if not is_hedge and "announce" not in tags:
+            _persist_chat_side_effects(
+                session_id=session_id,
+                user_message=req.message,
+                reply=reply,
+                usage=usage,
+                clsm_memory_block=context.clsm_memory_block,
+                reasoning_meta=context.reasoning_meta,
+                skip_stack_history=is_discord,
+            )
+            background_tasks.add_task(_run_memory_web_enrich_safe, context.reasoning_result)
 
         total_elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         print(

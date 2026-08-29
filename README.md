@@ -33,6 +33,8 @@ On branch **`agent-model`**, default identity is **companion** (`AGENT_IDENTITY=
 
 Pair with **seki-inference-engine** branch `agent-model` and run the A/B benchmark documented in `seki-inference-engine/docs/AGENT_MODEL_BENCHMARK.md`.
 
+**Decision (2026-08-29):** Production chat model is **`seki-qwen-3b`** with companion identity. See `seki-inference-engine/docs/AGENT_MODEL_REPORT.md`.
+
 **This process is CPU-side.** GPU belongs to `seki-inference-engine` / vLLM / Ollama.
 
 - Python **3.10** (Docker image) or 3.10+ locally

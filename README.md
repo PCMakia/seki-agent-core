@@ -27,7 +27,13 @@ Useful HTTP:
 
 Announce (ambient Discord) turns are **not** written back into the graph, so channel musings do not lock the hottest nodes onto one riff.
 
-## Hardware and prerequisites
+## Branch `agent-model` (companion identity)
+
+On branch **`agent-model`**, default identity is **companion** (`AGENT_IDENTITY=companion`) instead of the v1 secretary workplace voice. Default chat mode is **BANTERING** (`AGENT_DEFAULT_MODE=BANTERING`). Set `AGENT_IDENTITY=secretary` to restore legacy prompts.
+
+Pair with **seki-inference-engine** branch `agent-model` and run the A/B benchmark documented in `seki-inference-engine/docs/AGENT_MODEL_BENCHMARK.md`.
+
+**Decision (2026-08-29):** Production chat model is **`seki-qwen-3b`** with companion identity. See `seki-inference-engine/docs/AGENT_MODEL_REPORT.md`.
 
 **This process is CPU-side.** GPU belongs to `seki-inference-engine` / vLLM / Ollama.
 

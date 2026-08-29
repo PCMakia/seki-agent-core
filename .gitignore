@@ -6,6 +6,7 @@ tests
 .env.*
 !.env.example
 data/*.sqlite3
+data-test/
 debug-*.log
 set_*
 .venv/
